@@ -16,6 +16,11 @@ Docker containers for:
 | `debian9` | Debian 9 (stretch) | 2.24 |
 | `ubuntu22` | Ubuntu 22.04 LTS | 2.35 |
 | `ubuntu24` | Ubuntu 24.04 LTS | 2.38 |
+| `musl-static` | Alpine/any Linux | none (static) |
+
+The workflow also compiles a **static musl binary** (`x86_64-unknown-linux-musl`)
+and commits it to `bin/tinycfs-linux-x86_64` in the repository so it is always
+available for direct download without a release page.
 
 To trigger manually without pushing:
 ```bash

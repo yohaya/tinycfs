@@ -20,8 +20,15 @@ name = "sim"
 path = "src/bin/sim.rs"
 
 [dependencies]
-# FUSE filesystem binding
-fuser = "0.14"
+# FUSE filesystem binding — pure-rust base (no libfuse C dependency).
+# Non-musl targets (glibc Linux, macOS) additionally enable the libfuse feature
+# via the target-specific section below.
+fuser = { version = "0.14", default-features = false }
+
+# ── Target-specific: re-enable libfuse on glibc Linux / macOS ────────────────
+# musl targets keep default-features=false and get the zero-C pure-rust FUSE impl.
+[target.'cfg(not(target_env = "musl"))'.dependencies]
+fuser = { version = "0.14", default-features = false, features = ["libfuse"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -32,6 +39,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = "1"
 bytes = "1"
+
+# Persistence — SQLite with bundled static library (no system libsqlite3 needed)
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 # CLI argument parsing
 clap = { version = "4", features = ["derive", "env"] }

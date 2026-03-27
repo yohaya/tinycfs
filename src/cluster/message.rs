@@ -70,6 +70,30 @@ pub enum FileOp {
         atime: Option<u64>,
         size: Option<u64>,
     },
+
+    // ── Distributed file locking ─────────────────────────────────────────────
+
+    /// Try to acquire an exclusive lock on `path`.
+    /// Fails (LockContended) if a different holder already holds a non-expired lock.
+    AcquireLock {
+        path: String,
+        /// Unique string identifying the lock owner, e.g. "node1:12345".
+        holder_id: String,
+        /// Lock TTL in seconds. The lock is automatically released if the holder
+        /// does not renew within this period (prevents dead-lock from crashed nodes).
+        ttl_secs: u64,
+    },
+    /// Release a lock.  Idempotent if the lock is already gone.
+    ReleaseLock {
+        path: String,
+        holder_id: String,
+    },
+    /// Extend the TTL of an existing lock held by `holder_id`.
+    RenewLock {
+        path: String,
+        holder_id: String,
+        ttl_secs: u64,
+    },
 }
 
 /// Result of a filesystem operation sent back to the waiting client.
@@ -77,6 +101,9 @@ pub enum FileOp {
 pub enum FileOpResult {
     Ok,
     Error(String),
+    /// Lock is held by the named holder — used to propagate LockContended back
+    /// to the proposer so it can return EWOULDBLOCK or retry (setlkw).
+    LockContended(String),
 }
 
 // ─── Raft messages ───────────────────────────────────────────────────────────
@@ -114,6 +141,27 @@ pub struct AppendEntriesReply {
     pub match_index: LogIndex,
 }
 
+// ─── InstallSnapshot ─────────────────────────────────────────────────────────
+
+/// Sent by the leader when a follower's next_index has fallen behind the
+/// leader's snapshot boundary (log compaction trimmed the entries it needs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshot {
+    pub term: Term,
+    pub leader_id: NodeId,
+    pub snapshot_index: LogIndex,
+    pub snapshot_term: Term,
+    /// Serialized `FileStore` state at `snapshot_index`.
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotReply {
+    pub term: Term,
+    /// Highest log index now confirmed on this follower (= snapshot_index on success).
+    pub match_index: LogIndex,
+}
+
 // ─── Top-level network message ───────────────────────────────────────────────
 
 /// Every message exchanged between cluster nodes.
@@ -137,6 +185,8 @@ pub enum Message {
     RequestVoteReply(RequestVoteReply),
     AppendEntries(AppendEntries),
     AppendEntriesReply(AppendEntriesReply),
+    InstallSnapshot(InstallSnapshot),
+    InstallSnapshotReply(InstallSnapshotReply),
 
     // ── Client request forwarding ───────────────────────────────────────────
     /// A follower forwards a write request to the leader.

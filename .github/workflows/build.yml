@@ -106,11 +106,83 @@ jobs:
           path: tinycfs-${{ matrix.name }}-x86_64
           if-no-files-found: error
 
+  # ── Static musl binary (zero glibc dependency) ───────────────────────────
+  build-musl:
+    name: Build · musl-static
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+
+      - name: Add musl Rust target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Build static musl binary
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-musl 2>&1
+          # Verify it is truly statically linked
+          file target/x86_64-unknown-linux-musl/release/tinycfs
+          ldd  target/x86_64-unknown-linux-musl/release/tinycfs || true
+
+      - name: Smoke-test static binary
+        run: ./target/x86_64-unknown-linux-musl/release/tinycfs --help || true
+
+      - name: Copy artifact
+        run: cp target/x86_64-unknown-linux-musl/release/tinycfs tinycfs-musl-x86_64
+
+      - name: Upload binary (musl-static)
+        uses: actions/upload-artifact@v4
+        with:
+          name: tinycfs-musl-x86_64
+          path: tinycfs-musl-x86_64
+          if-no-files-found: error
+
+  # ── Commit static binary to bin/ in the repository ───────────────────────
+  publish-bin:
+    name: Publish bin/tinycfs-linux-x86_64
+    runs-on: ubuntu-latest
+    needs: build-musl
+    if: github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Use a token so the push can trigger downstream workflows if needed.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tinycfs-musl-x86_64
+          path: bin/
+
+      - name: Rename artifact to canonical name
+        run: mv bin/tinycfs-musl-x86_64 bin/tinycfs-linux-x86_64
+
+      - name: Make binary executable
+        run: chmod +x bin/tinycfs-linux-x86_64
+
+      - name: Commit and push binary
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bin/tinycfs-linux-x86_64
+          git diff --cached --quiet && echo "binary unchanged, nothing to commit" && exit 0
+          git commit -m "ci: update bin/tinycfs-linux-x86_64 [skip ci]"
+          git push
+
   # ── Collect all binaries into a single release artifact ──────────────────
   package:
     name: Package release bundle
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, build-musl]
     if: github.ref == 'refs/heads/main'
 
     steps:

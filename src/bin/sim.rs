@@ -22,13 +22,10 @@ use tokio::time;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-// Pull in the library modules from the main crate.
-// `sim` lives in src/bin/sim.rs so it can access crate:: items the same way
-// as main.rs does.
 use tinycfs::cluster::{Cluster, ClusterOptions};
+use tinycfs::cluster::message::FileOp;
 use tinycfs::config::{Config, NodeConfig};
 use tinycfs::consensus::Consensus;
-use tinycfs::cluster::message::FileOp;
 use tinycfs::fs::store::FileStore;
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -68,7 +65,6 @@ struct Args {
 // ─── Per-node handle ──────────────────────────────────────────────────────────
 
 struct SimNode {
-    name: String,
     consensus: Consensus,
     store: Arc<RwLock<FileStore>>,
 }
@@ -76,8 +72,6 @@ struct SimNode {
 // ─── Latency histogram (lock-free, microsecond buckets) ───────────────────────
 
 struct Histogram {
-    /// Buckets: index i covers [i*100 µs, (i+1)*100 µs)
-    /// Up to 5 000 ms (50 000 * 100 µs).
     buckets: Vec<AtomicU64>,
     count: AtomicU64,
     sum_us: AtomicU64,
@@ -118,7 +112,9 @@ impl Histogram {
 
     fn mean(&self) -> Duration {
         let c = self.count.load(Ordering::Relaxed);
-        if c == 0 { return Duration::ZERO; }
+        if c == 0 {
+            return Duration::ZERO;
+        }
         Duration::from_micros(self.sum_us.load(Ordering::Relaxed) / c)
     }
 }
@@ -128,29 +124,33 @@ impl Histogram {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new("warn,sim=info,tinycfs=warn"))
+        .with_env_filter(EnvFilter::new("warn,sim=info,tinycfs=debug"))
         .init();
 
     let args = Args::parse();
 
     if args.nodes < 3 {
-        eprintln!("ERROR: --nodes must be at least 3 (Raft needs an odd quorum ≥ 3)");
+        eprintln!("ERROR: --nodes must be at least 3 (Raft needs an odd quorum >= 3)");
         std::process::exit(1);
     }
 
     info!(
         "Simulation: {} nodes, {} rps, delay {}-{} ms, {} s (+{} s warmup)",
-        args.nodes, args.rps,
-        args.delay_min_ms, args.delay_max_ms,
-        args.duration_secs, args.warmup_secs,
+        args.nodes,
+        args.rps,
+        args.delay_min_ms,
+        args.delay_max_ms,
+        args.duration_secs,
+        args.warmup_secs,
     );
 
-    // ── Build per-node configs ────────────────────────────────────────────
+    // ── Build per-node configs ─────────────────────────────────────────────
     let node_configs: Vec<NodeConfig> = (0..args.nodes)
         .map(|i| NodeConfig {
             name: format!("sim-{}", i),
             ip: "127.0.0.1".to_string(),
             port: args.base_port + i as u16,
+            observer: false,
         })
         .collect();
 
@@ -161,7 +161,7 @@ async fn main() {
         )),
     };
 
-    // ── Start all nodes ───────────────────────────────────────────────────
+    // ── Start all nodes ────────────────────────────────────────────────────
     let mut nodes: Vec<SimNode> = Vec::with_capacity(args.nodes);
 
     for i in 0..args.nodes {
@@ -169,57 +169,52 @@ async fn main() {
             cluster_name: "sim".to_string(),
             local_node: format!("sim-{}", i),
             data_dir: None,
+            max_file_size_bytes: 64 * 1024, // 64 KiB limit in simulation
+            snapshot_every: 50_000,
             nodes: node_configs.clone(),
         };
 
         let (cluster_handle, _cluster) =
             Cluster::start_with_opts(config.clone(), cluster_opts.clone()).await;
 
-        let (consensus, mut apply_rx, msg_tx) = Consensus::new(cluster_handle.clone());
+        let store = Arc::new(RwLock::new(FileStore::new()));
+        let (consensus, msg_tx) = Consensus::new(
+            cluster_handle.clone(),
+            None,
+            store.clone(),
+            config.snapshot_every as u64,
+        );
 
-        // Forward inbound cluster messages to the Raft actor
+        // Forward inbound cluster messages to the Raft actor.
         let rx_in = cluster_handle.rx_in.clone();
         tokio::spawn(async move {
             loop {
                 let env = rx_in.lock().await.recv().await;
                 match env {
-                    Some(e) => { if msg_tx.send(e).await.is_err() { break; } }
+                    Some(e) => {
+                        if msg_tx.send(e).await.is_err() {
+                            break;
+                        }
+                    }
                     None => break,
                 }
             }
         });
 
-        // Apply committed log entries to the local FileStore
-        let store = Arc::new(RwLock::new(FileStore::new()));
-        let store2 = store.clone();
-        tokio::spawn(async move {
-            while let Some(entry) = apply_rx.recv().await {
-                let mut st = store2.write();
-                if let Err(e) = st.apply(&entry.op) {
-                    // AlreadyExists is expected on idempotent replayed creates
-                    if !e.to_string().contains("Already exists") {
-                        warn!("State machine: {}", e);
-                    }
-                }
-            }
-        });
-
-        nodes.push(SimNode {
-            name: format!("sim-{}", i),
-            consensus,
-            store,
-        });
+        nodes.push(SimNode { consensus, store });
     }
 
-    // ── Wait for leader election ──────────────────────────────────────────
+    // ── Wait for leader election ───────────────────────────────────────────
     let warmup = Duration::from_secs(args.warmup_secs);
     info!("Waiting {}s for cluster to stabilise…", args.warmup_secs);
     time::sleep(warmup).await;
 
-    // Verify leader elected
     let leader_found = nodes.iter().any(|n| n.consensus.is_leader());
     if !leader_found {
-        error!("No leader elected after {}s — check ports and network settings", args.warmup_secs);
+        error!(
+            "No leader elected after {}s — check ports and network settings",
+            args.warmup_secs
+        );
         std::process::exit(1);
     }
     info!("Leader elected. Starting load test…");
@@ -229,12 +224,11 @@ async fn main() {
     let err_count = Arc::new(AtomicU64::new(0));
     let hist = Histogram::new();
 
-    // Share node consensus handles
-    let consensuses: Vec<Consensus> = nodes.iter().map(|n| n.consensus.clone()).collect();
-    let consensuses = Arc::new(consensuses);
+    let consensuses: Arc<Vec<Consensus>> =
+        Arc::new(nodes.iter().map(|n| n.consensus.clone()).collect());
 
     let duration = Duration::from_secs(args.duration_secs);
-    let interval_ns = 1_000_000_000u64 / args.rps;
+    let interval_ns = 1_000_000_000u64 / args.rps.max(1);
     let start = Instant::now();
     let end_time = start + duration;
 
@@ -243,14 +237,12 @@ async fn main() {
 
     while Instant::now() < end_time {
         if Instant::now() < next_tick {
-            // Yield to allow tokio tasks to run (heartbeats, etc.)
             tokio::task::yield_now().await;
             continue;
         }
         next_tick += Duration::from_nanos(interval_ns);
         seq += 1;
 
-        // Pick a random node to submit through (tests follower forwarding too)
         let node_idx = rand::thread_rng().gen_range(0..consensuses.len());
         let consensus = consensuses[node_idx].clone();
         let ok = ok_count.clone();
@@ -271,8 +263,7 @@ async fn main() {
                     ok.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    // NotLeader / NoQuorum during leader election are expected
-                    let _ = e;
+                    warn!("Proposal error: {}", e);
                     err.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -281,12 +272,10 @@ async fn main() {
 
     let total_elapsed = start.elapsed();
 
-    // ── Wait for all proposals to flush ──────────────────────────────────
     info!("Load test done. Waiting 2s for final commits to flush…");
     time::sleep(Duration::from_secs(2)).await;
 
-    // ── Consistency check ─────────────────────────────────────────────────
-    // Hash each node's store and compare
+    // ── Consistency check ──────────────────────────────────────────────────
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -295,13 +284,12 @@ async fn main() {
         .map(|n| {
             let store = n.store.read();
             let mut h = DefaultHasher::new();
-            // We hash a sorted representation of all file paths + data
             let mut paths: Vec<(String, Vec<u8>)> = Vec::new();
-            for key in 1u64..1000 {
-                let path = format!("/file-{}.txt", key % 1000);
-                if let Some(ino) = store.lookup(1, &path.trim_start_matches('/')) {
+            for key in 0u64..1000 {
+                let path_str = format!("file-{}.txt", key);
+                if let Some(ino) = store.lookup(1, &path_str) {
                     if let Some(tinycfs::fs::inode::Inode::File(f)) = store.get(ino) {
-                        paths.push((path, f.data.clone()));
+                        paths.push((path_str, f.data.clone()));
                     }
                 }
             }
@@ -341,13 +329,12 @@ async fn main() {
     println!("───────────────────────────────────────────────────────");
     println!(
         " Consistency:    {}",
-        if all_same { "PASS ✓ — all stores converge to identical state" }
-        else        { "FAIL ✗ — stores diverged! (possible Raft bug)" }
+        if all_same { "PASS - all stores converge to identical state" }
+        else { "FAIL - stores diverged! (possible Raft bug)" }
     );
     println!("═══════════════════════════════════════════════════════");
     println!();
 
-    // Exit with non-zero if consistency failed or success rate < 95%
     if !all_same || success_pct < 95.0 {
         std::process::exit(1);
     }

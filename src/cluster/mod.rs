@@ -1,10 +1,12 @@
 pub mod message;
 pub mod transport;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::time::Instant;
 
 use parking_lot::RwLock;
 use tokio::net::{TcpListener, TcpStream};
@@ -33,8 +35,14 @@ pub struct ClusterHandle {
     pub tx_out: mpsc::UnboundedSender<(NodeId, Message)>,
     /// Receives messages from any peer.
     pub rx_in: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Envelope>>>,
-    /// Current set of connected peers.
+    /// Current set of connected peers (node_id → name).
     pub peers: Arc<RwLock<HashMap<NodeId, String>>>,
+    /// Node IDs that are configured as non-voting observers.
+    pub observer_ids: Arc<HashSet<NodeId>>,
+    /// Total number of voting nodes in the cluster (from config; includes self).
+    pub total_voting_nodes: usize,
+    /// Whether this node itself is an observer.
+    pub is_observer: bool,
 }
 
 impl ClusterHandle {
@@ -51,20 +59,38 @@ impl ClusterHandle {
         }
     }
 
-    /// Number of currently connected peers.
+    /// Number of currently connected peers (all, including observers).
     pub fn peer_count(&self) -> usize {
         self.peers.read().len()
     }
 
-    /// IDs of currently connected peers.
+    /// IDs of currently connected peers (all, including observers).
     pub fn peer_ids(&self) -> Vec<NodeId> {
         self.peers.read().keys().copied().collect()
+    }
+
+    /// IDs of currently connected voting peers (excludes observers).
+    pub fn voting_peer_ids(&self) -> Vec<NodeId> {
+        self.peers
+            .read()
+            .keys()
+            .copied()
+            .filter(|id| !self.observer_ids.contains(id))
+            .collect()
+    }
+
+    /// Whether a given peer is an observer.
+    pub fn is_peer_observer(&self, id: NodeId) -> bool {
+        self.observer_ids.contains(&id)
     }
 }
 
 /// Per-connection state kept by the cluster manager.
 struct Conn {
-    tx: mpsc::UnboundedSender<Message>,
+    /// Carries (send_time, message) so the writer task can compute the correct
+    /// simulated delivery time relative to when the message was actually sent,
+    /// not relative to when the writer task happens to wake up.
+    tx: mpsc::UnboundedSender<(Instant, Message)>,
 }
 
 /// Optional cluster configuration that affects runtime behaviour.
@@ -102,6 +128,18 @@ impl Cluster {
         let conns: Arc<RwLock<HashMap<NodeId, Conn>>> = Arc::new(RwLock::new(HashMap::new()));
         let peers: Arc<RwLock<HashMap<NodeId, String>>> = Arc::new(RwLock::new(HashMap::new()));
 
+        // Build observer set and total voting count from config.
+        let observer_ids: Arc<HashSet<NodeId>> = Arc::new(
+            config
+                .nodes
+                .iter()
+                .filter(|n| n.observer)
+                .map(|n| Config::node_id(&n.name))
+                .collect(),
+        );
+        let total_voting_nodes = config.total_voting_nodes();
+        let is_observer = config.is_observer();
+
         let (env_tx, env_rx) = mpsc::unbounded_channel::<Envelope>();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<(NodeId, Message)>();
 
@@ -138,7 +176,10 @@ impl Cluster {
             while let Some((to, msg)) = out_rx.recv().await {
                 let tx = conns3.read().get(&to).map(|c| c.tx.clone());
                 if let Some(tx) = tx {
-                    let _ = tx.send(msg);
+                    // Stamp with the time the message reached the outbound queue
+                    // so the writer task computes delay relative to the true
+                    // send instant, not relative to when it wakes up.
+                    let _ = tx.send((Instant::now(), msg));
                 } else {
                     debug!("No connection to node {:x}, dropping message", to);
                 }
@@ -146,6 +187,10 @@ impl Cluster {
         });
 
         // ── Connector tasks for each peer ──────────────────────────────────
+        // Only connect to peers with a higher node ID than ours.  This ensures
+        // exactly one TCP connection per pair (the lower-ID side initiates).
+        // The higher-ID side accepts via handle_incoming, which registers the
+        // peer in its own `conns` so it can send back over the same socket.
         let cluster = Cluster {
             config: config.clone(),
             local_id,
@@ -154,6 +199,10 @@ impl Cluster {
         };
 
         for peer in config.peer_nodes() {
+            let peer_id = Config::node_id(&peer.name);
+            if peer_id <= local_id {
+                continue; // higher-ID peer will connect to us
+            }
             let peer = peer.clone();
             let conns = conns.clone();
             let peers = peers.clone();
@@ -169,6 +218,9 @@ impl Cluster {
             tx_out: out_tx,
             rx_in: Arc::new(tokio::sync::Mutex::new(env_rx)),
             peers,
+            observer_ids,
+            total_voting_nodes,
+            is_observer,
         };
 
         (handle, cluster)
@@ -227,7 +279,7 @@ async fn connect_to_peer(
 
                 // Split into reader + writer
                 let (read_half, write_half) = stream.into_split();
-                let (tx, rx) = mpsc::unbounded_channel::<Message>();
+                let (tx, rx) = mpsc::unbounded_channel::<(Instant, Message)>();
 
                 conns.write().insert(peer_id, Conn { tx });
                 peers.write().insert(peer_id, peer.name.clone());
@@ -292,7 +344,7 @@ async fn handle_incoming(
     info!("Accepted peer {} (id={:x})", peer_name, peer_id);
 
     let (read_half, write_half) = stream.into_split();
-    let (tx, rx) = mpsc::unbounded_channel::<Message>();
+    let (tx, rx) = mpsc::unbounded_channel::<(Instant, Message)>();
 
     conns.write().insert(peer_id, Conn { tx });
     peers.write().insert(peer_id, peer_name.clone());
@@ -349,24 +401,52 @@ async fn reader_task(
 }
 
 /// Drains a channel and writes messages to the TCP write-half.
-/// If `delay` is Some((min, max)), sleeps for a random duration in that range
-/// before each send — used by the simulation to model network latency.
+///
+/// Network delay model (simulation only):
+/// Each message m_i is assigned an independent random delay D_i and is
+/// delivered at max(send_time_i + D_i, last_deliver_time).  This means
+/// that if the previous message is still "in flight", the new message
+/// piggybacks on it and is delivered immediately after — which is correct
+/// for an ordered TCP channel.  Crucially, delays are NOT cumulative: a
+/// heartbeat sent while many data messages are queued still arrives within
+/// D_i ms of being sent (modulo the time to finish writing the previous
+/// message), preventing heartbeat starvation.
+///
+/// Each message carries the `Instant` at which it was placed in this task's
+/// channel by the outbound dispatcher.  The delivery time is computed as
+/// `sent_at + rand(min..max)`, clamped to `last_deliver` for ordering.
+/// Using `sent_at` (rather than `Instant::now()` at dequeue time) prevents
+/// `last_deliver` from accumulating indefinitely when the channel fills up
+/// faster than the simulated link can drain it.
 async fn writer_task(
     mut write_half: tokio::net::tcp::OwnedWriteHalf,
-    mut rx: mpsc::UnboundedReceiver<Message>,
+    mut rx: mpsc::UnboundedReceiver<(Instant, Message)>,
     peer_name: String,
     delay: Option<(Duration, Duration)>,
 ) {
     use rand::Rng;
     use tokio::io::AsyncWriteExt;
 
-    while let Some(msg) = rx.recv().await {
-        // Inject artificial network delay (simulation only)
-        if let Some((min, max)) = delay {
+    // Tracks the earliest time the write half is "free" (previous write done).
+    let mut last_deliver = Instant::now();
+
+    while let Some((sent_at, msg)) = rx.recv().await {
+        // Compute when this message should be delivered.
+        let deliver_at = if let Some((min, max)) = delay {
             let ms = rand::thread_rng()
                 .gen_range(min.as_millis() as u64..=max.as_millis() as u64);
-            time::sleep(Duration::from_millis(ms)).await;
-        }
+            // Use sent_at so the delay is relative to when the message was
+            // actually sent, not when this task happened to wake up.
+            let intended = sent_at + Duration::from_millis(ms);
+            // Can't deliver before the previous message is written.
+            intended.max(last_deliver)
+        } else {
+            Instant::now()
+        };
+        last_deliver = deliver_at;
+
+        // sleep_until is a no-op if deliver_at has already passed.
+        time::sleep_until(deliver_at).await;
 
         let payload = match bincode::serialize(&msg) {
             Ok(p) => p,
