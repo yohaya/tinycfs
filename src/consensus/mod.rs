@@ -1,10 +1,32 @@
 pub mod log;
 
+/// High-throughput Raft consensus engine.
+///
+/// Design goals for hundreds of nodes / thousands of writes per second:
+///
+/// 1. **Actor model** — a single dedicated tokio task owns all mutable Raft
+///    state; no Mutex contention between concurrent proposals.
+/// 2. **Proposal batching** — `propose()` queues work into a bounded channel;
+///    the Raft task drains the full channel each tick and appends all ops in
+///    one `AppendEntries` RPC instead of one RPC per write.
+/// 3. **Parallel per-peer replication** — each peer gets an independent
+///    async write path; a slow peer does not stall others.
+/// 4. **Pipelined AppendEntries** — the leader does not wait for an
+///    acknowledgement before sending the next batch; in-flight entries are
+///    tracked per peer via `next_index` / `match_index`.
+///
+/// Throughput model (rough):
+///   - Batch window: 1 ms → at 10 000 writes/s each batch has ~10 entries.
+///   - Leader sends one RPC to each of N peers per batch: O(N) fan-out.
+///   - For N ≤ ~200 this is fine on a 1 Gbit LAN.
+///   - For N > 200 add a hierarchical relay layer (not yet implemented):
+///     split peers into relay groups; each relay replicates its sub-tree.
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 use tracing::{debug, info, warn};
@@ -13,22 +35,32 @@ use crate::cluster::message::{
     AppendEntries, AppendEntriesReply, FileOp, FileOpResult, LogEntry, LogIndex, Message, NodeId,
     RequestVote, RequestVoteReply, Term,
 };
-use crate::cluster::ClusterHandle;
+use crate::cluster::{ClusterHandle, Envelope};
 use crate::consensus::log::Log;
 use crate::error::{Result, TinyCfsError};
 
-/// Timing constants (inspired by Raft paper recommendations).
-const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
+// ─── Tunables ─────────────────────────────────────────────────────────────────
+
+/// How often the leader sends heartbeats (and flushes pending proposals).
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(5);
+/// Randomised election timeout range.
 const ELECTION_TIMEOUT_MIN: Duration = Duration::from_millis(150);
 const ELECTION_TIMEOUT_MAX: Duration = Duration::from_millis(300);
+/// Maximum entries per AppendEntries RPC (limits per-RPC payload size).
+const MAX_ENTRIES_PER_RPC: usize = 256;
+/// Proposal queue depth — limits memory when the cluster falls behind.
+const PROPOSAL_QUEUE_DEPTH: usize = 16_384;
 
-/// A pending client request waiting for its log entry to commit.
-struct Pending {
-    index: LogIndex,
-    tx: oneshot::Sender<FileOpResult>,
+// ─── Public proposal API ──────────────────────────────────────────────────────
+
+/// A single write proposal enqueued by a FUSE handler.
+pub struct Proposal {
+    pub op: FileOp,
+    /// Fires with Ok/Err once the entry is committed by a quorum.
+    pub done: oneshot::Sender<FileOpResult>,
 }
 
-// ─── Raft role ────────────────────────────────────────────────────────────────
+// ─── Internal Raft state (owned by the Raft actor task) ──────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 enum Role {
@@ -41,7 +73,9 @@ enum Role {
         election_deadline: Instant,
     },
     Leader {
+        /// Per-peer: next log index to send.
         next_index: HashMap<NodeId, LogIndex>,
+        /// Per-peer: highest index known to be replicated on that peer.
         match_index: HashMap<NodeId, LogIndex>,
         last_heartbeat: Instant,
     },
@@ -57,10 +91,8 @@ impl Role {
     }
 }
 
-// ─── Raft state ───────────────────────────────────────────────────────────────
-
 struct RaftState {
-    // Persistent (conceptual — kept in memory for now)
+    // Persistent fields (kept in-memory; snapshot/WAL is a future concern)
     current_term: Term,
     voted_for: Option<NodeId>,
     log: Log,
@@ -70,11 +102,11 @@ struct RaftState {
     last_applied: LogIndex,
     role: Role,
 
-    // Pending client proposals
-    pending: Vec<Pending>,
+    // Pending proposals — resolved when their log index commits.
+    pending: Vec<(LogIndex, oneshot::Sender<FileOpResult>)>,
 
-    // Request ID counter
-    next_request_id: u64,
+    // Monotonic request counter (used to tag forwarded client requests)
+    next_req_id: u64,
 }
 
 impl RaftState {
@@ -87,20 +119,11 @@ impl RaftState {
             last_applied: 0,
             role: Role::Follower {
                 leader: None,
-                election_deadline: random_election_deadline(),
+                election_deadline: random_deadline(),
             },
             pending: Vec::new(),
-            next_request_id: 1,
+            next_req_id: 1,
         }
-    }
-
-    fn become_follower(&mut self, term: Term, leader: Option<NodeId>) {
-        self.current_term = term;
-        self.voted_for = None;
-        self.role = Role::Follower {
-            leader,
-            election_deadline: random_election_deadline(),
-        };
     }
 
     fn is_leader(&self) -> bool {
@@ -110,108 +133,122 @@ impl RaftState {
     fn leader_id(&self) -> Option<NodeId> {
         match &self.role {
             Role::Follower { leader, .. } => *leader,
-            Role::Leader { .. } => None, // We are the leader
-            Role::Candidate { .. } => None,
+            _ => None,
         }
     }
-}
 
-fn random_election_deadline() -> Instant {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let ms = rng.gen_range(
-        ELECTION_TIMEOUT_MIN.as_millis()..=ELECTION_TIMEOUT_MAX.as_millis(),
-    ) as u64;
-    Instant::now() + Duration::from_millis(ms)
-}
-
-// ─── Consensus engine ─────────────────────────────────────────────────────────
-
-/// Shared handle to the Raft consensus engine. Clone-able and Send.
-#[derive(Clone)]
-pub struct Consensus {
-    inner: Arc<ConsensusInner>,
-}
-
-struct ConsensusInner {
-    state: Mutex<RaftState>,
-    /// Committed log entries are sent here so the FUSE state machine can apply them.
-    apply_tx: mpsc::UnboundedSender<LogEntry>,
-    /// Cluster handle for sending messages.
-    cluster: ClusterHandle,
-}
-
-impl Consensus {
-    /// Create the consensus engine. Returns (Consensus, apply_rx) where apply_rx
-    /// delivers committed log entries to the state machine in order.
-    pub fn new(
-        cluster: ClusterHandle,
-    ) -> (Self, mpsc::UnboundedReceiver<LogEntry>) {
-        let (apply_tx, apply_rx) = mpsc::unbounded_channel();
-        let inner = Arc::new(ConsensusInner {
-            state: Mutex::new(RaftState::new()),
-            apply_tx,
-            cluster,
-        });
-        (Consensus { inner }, apply_rx)
+    fn become_follower(&mut self, term: Term, leader: Option<NodeId>) {
+        self.current_term = term;
+        self.voted_for = None;
+        self.role = Role::Follower {
+            leader,
+            election_deadline: random_deadline(),
+        };
     }
 
-    /// Start the Raft background ticker.
-    pub fn start(&self) {
-        let c = self.clone();
-        tokio::spawn(async move { c.run_ticker().await });
-    }
+    /// Advance `last_applied` up to `commit_index` and fire callbacks.
+    /// Returns committed entries (for the apply channel).
+    fn advance_applied(&mut self) -> Vec<LogEntry> {
+        let mut applied = Vec::new();
+        while self.last_applied < self.commit_index {
+            self.last_applied += 1;
+            if let Some(entry) = self.log.get(self.last_applied).cloned() {
+                applied.push(entry.clone());
 
-    /// Submit a write operation. Blocks until committed by a quorum.
-    /// Can be called from any thread (including blocking FUSE threads).
-    pub async fn propose(&self, op: FileOp) -> Result<()> {
-        // If we are the leader, append to log directly.
-        // If we are a follower, forward to the leader and wait.
-        let (tx, rx) = oneshot::channel();
-
-        {
-            let mut st = self.inner.state.lock();
-            if st.is_leader() {
-                let index = st.log.last_index() + 1;
-                let request_id = st.next_request_id;
-                st.next_request_id += 1;
-                let entry = LogEntry {
-                    index,
-                    term: st.current_term,
-                    request_id,
-                    client_node: self.inner.cluster.local_id,
-                    op,
-                };
-                st.log.append(entry);
-                st.pending.push(Pending { index, tx });
-                // Heartbeat will replicate it immediately
-            } else {
-                // Forward to leader
-                match st.leader_id() {
-                    Some(leader_id) => {
-                        let request_id = st.next_request_id;
-                        st.next_request_id += 1;
-                        drop(st);
-                        let msg = Message::ClientRequest { request_id, op };
-                        self.inner.cluster.send(leader_id, msg);
-                        // Store pending indexed by request_id so we can match response
-                        // For simplicity, we use a oneshot and match by request_id
-                        // (see handle_client_response)
-                        drop(tx); // The forwarding path returns error for now
-                        return Err(TinyCfsError::NotLeader { leader_hint: Some(leader_id) });
-                    }
-                    None => {
-                        return Err(TinyCfsError::NoQuorum);
+                // Resolve any pending proposals at this index
+                let idx = self.last_applied;
+                let mut i = 0;
+                while i < self.pending.len() {
+                    if self.pending[i].0 == idx {
+                        let (_, tx) = self.pending.remove(i);
+                        let _ = tx.send(FileOpResult::Ok);
+                    } else {
+                        i += 1;
                     }
                 }
             }
         }
+        applied
+    }
+}
 
-        // Trigger immediate replication
-        self.replicate_to_all();
+fn random_deadline() -> Instant {
+    use rand::Rng;
+    let ms = rand::thread_rng().gen_range(
+        ELECTION_TIMEOUT_MIN.as_millis() as u64..=ELECTION_TIMEOUT_MAX.as_millis() as u64,
+    );
+    Instant::now() + Duration::from_millis(ms)
+}
 
-        // Wait for commit
-        match time::timeout(Duration::from_secs(5), rx).await {
+// ─── Shared public handle (clone-able, Send) ──────────────────────────────────
+
+/// Lightweight handle to the Raft engine.  Clone freely — it is just a few
+/// cheap Arc/channel clones.
+#[derive(Clone)]
+pub struct Consensus {
+    proposal_tx: mpsc::Sender<Proposal>,
+    /// Read-only snapshot of role + leader for routing purposes.
+    pub_state: Arc<RwLock<PubState>>,
+    local_id: NodeId,
+}
+
+/// Read-only public state — updated by the Raft actor after every role change.
+#[derive(Clone, Default)]
+pub struct PubState {
+    pub is_leader: bool,
+    pub leader_id: Option<NodeId>,
+    pub current_term: Term,
+}
+
+impl Consensus {
+    /// Build the consensus engine.
+    ///
+    /// Returns:
+    /// - `Consensus` handle for FUSE and the main task to use.
+    /// - `mpsc::UnboundedReceiver<LogEntry>` — committed entries delivered
+    ///   in order; pipe these into the filesystem state machine.
+    /// - `mpsc::Sender<Envelope>` — pipe incoming cluster messages here.
+    pub fn new(
+        cluster: ClusterHandle,
+    ) -> (
+        Self,
+        mpsc::UnboundedReceiver<LogEntry>,
+        mpsc::Sender<Envelope>,
+    ) {
+        let (proposal_tx, proposal_rx) = mpsc::channel(PROPOSAL_QUEUE_DEPTH);
+        let (apply_tx, apply_rx) = mpsc::unbounded_channel();
+        let (msg_tx, msg_rx) = mpsc::channel(4096);
+        let pub_state = Arc::new(RwLock::new(PubState::default()));
+
+        let local_id = cluster.local_id;
+        let engine = RaftEngine {
+            state: RaftState::new(),
+            cluster,
+            apply_tx,
+            pub_state: pub_state.clone(),
+        };
+
+        tokio::spawn(engine.run(proposal_rx, msg_rx));
+
+        let handle = Consensus { proposal_tx, pub_state, local_id };
+        (handle, apply_rx, msg_tx)
+    }
+
+    /// Submit a write operation. Awaits until committed by a quorum (or timeout).
+    ///
+    /// This call is **non-blocking on the proposal queue**: it returns quickly
+    /// when the queue is full (back-pressure) by returning `NoQuorum`.
+    pub async fn propose(&self, op: FileOp) -> Result<()> {
+        let (done_tx, done_rx) = oneshot::channel();
+        let proposal = Proposal { op, done: done_tx };
+
+        // Enqueue — non-blocking; fails with NoQuorum under back-pressure.
+        self.proposal_tx
+            .try_send(proposal)
+            .map_err(|_| TinyCfsError::NoQuorum)?;
+
+        // Wait for the commit notification (5 s timeout)
+        match time::timeout(Duration::from_secs(5), done_rx).await {
             Ok(Ok(FileOpResult::Ok)) => Ok(()),
             Ok(Ok(FileOpResult::Error(e))) => Err(TinyCfsError::Cluster(e)),
             Ok(Err(_)) => Err(TinyCfsError::Cluster("proposal channel dropped".into())),
@@ -219,360 +256,395 @@ impl Consensus {
         }
     }
 
-    // ── Message processing ────────────────────────────────────────────────
+    /// Whether this node is currently the Raft leader.
+    pub fn is_leader(&self) -> bool {
+        self.pub_state.read().is_leader
+    }
 
-    /// Process a message from a peer.
-    pub fn handle_message(&self, from: NodeId, msg: Message) {
-        match msg {
-            Message::RequestVote(rv) => self.handle_request_vote(from, rv),
-            Message::RequestVoteReply(rvr) => self.handle_vote_reply(from, rvr),
-            Message::AppendEntries(ae) => self.handle_append_entries(from, ae),
-            Message::AppendEntriesReply(aer) => self.handle_append_entries_reply(from, aer),
-            Message::ClientRequest { request_id, op } => {
-                self.handle_forwarded_request(from, request_id, op)
+    /// Node ID of the current leader, if known.
+    pub fn leader_id(&self) -> Option<NodeId> {
+        self.pub_state.read().leader_id
+    }
+}
+
+// ─── The Raft actor (single tokio task, owns all mutable state) ───────────────
+
+struct RaftEngine {
+    state: RaftState,
+    cluster: ClusterHandle,
+    apply_tx: mpsc::UnboundedSender<LogEntry>,
+    pub_state: Arc<RwLock<PubState>>,
+}
+
+impl RaftEngine {
+    async fn run(
+        mut self,
+        mut proposal_rx: mpsc::Receiver<Proposal>,
+        mut msg_rx: mpsc::Receiver<Envelope>,
+    ) {
+        let mut ticker = time::interval(Duration::from_millis(1));
+        ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                biased;
+
+                // ── Incoming cluster messages ────────────────────────────
+                Some(env) = msg_rx.recv() => {
+                    self.handle_message(env.from, env.msg);
+                }
+
+                // ── Tick: heartbeat, election timeout, proposal flush ────
+                _ = ticker.tick() => {
+                    self.tick(&mut proposal_rx).await;
+                }
             }
-            Message::ClientResponse { request_id, result } => {
-                self.handle_client_response(request_id, result)
+        }
+    }
+
+    // ── Tick ──────────────────────────────────────────────────────────────
+
+    async fn tick(&mut self, proposal_rx: &mut mpsc::Receiver<Proposal>) {
+        let now = Instant::now();
+
+        match self.state.role.clone() {
+            Role::Follower { election_deadline, .. } => {
+                if now >= election_deadline {
+                    self.start_election();
+                }
+            }
+            Role::Candidate { election_deadline, .. } => {
+                if now >= election_deadline {
+                    self.start_election();
+                }
+            }
+            Role::Leader { last_heartbeat, .. } => {
+                // ── Batch all pending proposals ──────────────────────────
+                let mut batch: Vec<Proposal> = Vec::new();
+                // Non-blocking drain (bounded by MAX_ENTRIES_PER_RPC)
+                while batch.len() < MAX_ENTRIES_PER_RPC {
+                    match proposal_rx.try_recv() {
+                        Ok(p) => batch.push(p),
+                        Err(_) => break,
+                    }
+                }
+
+                let had_proposals = !batch.is_empty();
+                if had_proposals {
+                    self.append_batch(batch);
+                }
+
+                if now.duration_since(last_heartbeat) >= HEARTBEAT_INTERVAL || had_proposals {
+                    if let Role::Leader { ref mut last_heartbeat, .. } = self.state.role {
+                        *last_heartbeat = now;
+                    }
+                    self.replicate_to_all();
+                }
+            }
+        }
+    }
+
+    /// Append a batch of proposals to the local log as a contiguous range.
+    fn append_batch(&mut self, batch: Vec<Proposal>) {
+        for proposal in batch {
+            let idx = self.state.log.last_index() + 1;
+            let entry = LogEntry {
+                index: idx,
+                term: self.state.current_term,
+                request_id: self.state.next_req_id,
+                client_node: self.cluster.local_id,
+                op: proposal.op,
+            };
+            self.state.next_req_id += 1;
+            self.state.log.append(entry);
+            self.state.pending.push((idx, proposal.done));
+        }
+    }
+
+    // ── Raft message handlers ─────────────────────────────────────────────
+
+    fn handle_message(&mut self, from: NodeId, msg: Message) {
+        match msg {
+            Message::RequestVote(rv) => self.on_request_vote(from, rv),
+            Message::RequestVoteReply(rvr) => self.on_vote_reply(from, rvr),
+            Message::AppendEntries(ae) => self.on_append_entries(from, ae),
+            Message::AppendEntriesReply(aer) => self.on_append_entries_reply(from, aer),
+            Message::ClientRequest { request_id, op } => {
+                self.on_forwarded_request(from, request_id, op)
             }
             _ => {}
         }
     }
 
-    fn handle_request_vote(&self, from: NodeId, rv: RequestVote) {
-        let mut st = self.inner.state.lock();
-
-        if rv.term > st.current_term {
-            st.become_follower(rv.term, None);
+    fn on_request_vote(&mut self, from: NodeId, rv: RequestVote) {
+        if rv.term > self.state.current_term {
+            self.state.become_follower(rv.term, None);
         }
 
-        let grant = rv.term >= st.current_term
-            && (st.voted_for.is_none() || st.voted_for == Some(rv.candidate_id))
-            && (rv.last_log_term > st.log.last_term()
-                || (rv.last_log_term == st.log.last_term()
-                    && rv.last_log_index >= st.log.last_index()));
+        let grant = rv.term >= self.state.current_term
+            && (self.state.voted_for.is_none()
+                || self.state.voted_for == Some(rv.candidate_id))
+            && (rv.last_log_term > self.state.log.last_term()
+                || (rv.last_log_term == self.state.log.last_term()
+                    && rv.last_log_index >= self.state.log.last_index()));
 
         if grant {
-            st.voted_for = Some(rv.candidate_id);
-            // Reset election timer so we don't start our own election
-            if let Role::Follower { election_deadline, .. } = &mut st.role {
-                *election_deadline = random_election_deadline();
+            self.state.voted_for = Some(rv.candidate_id);
+            if let Role::Follower { ref mut election_deadline, .. } = self.state.role {
+                *election_deadline = random_deadline();
             }
-            debug!(
-                "Granting vote to {:x} for term {}",
-                rv.candidate_id, rv.term
-            );
         }
 
-        let reply = Message::RequestVoteReply(RequestVoteReply {
-            term: st.current_term,
-            vote_granted: grant,
-        });
-        drop(st);
-        self.inner.cluster.send(from, reply);
+        self.cluster.send(
+            from,
+            Message::RequestVoteReply(RequestVoteReply {
+                term: self.state.current_term,
+                vote_granted: grant,
+            }),
+        );
     }
 
-    fn handle_vote_reply(&self, from: NodeId, rvr: RequestVoteReply) {
-        let mut st = self.inner.state.lock();
-
-        if rvr.term > st.current_term {
-            st.become_follower(rvr.term, None);
+    fn on_vote_reply(&mut self, from: NodeId, rvr: RequestVoteReply) {
+        if rvr.term > self.state.current_term {
+            self.state.become_follower(rvr.term, None);
             return;
         }
 
-        if let Role::Candidate { ref mut votes, .. } = st.role {
+        if let Role::Candidate { ref mut votes, .. } = self.state.role {
             if rvr.vote_granted {
                 votes.insert(from);
-                let vote_count = votes.len() + 1; // +1 for self
-                let peers = self.inner.cluster.peer_count();
-                let quorum = (peers + 2) / 2; // majority of total nodes
+                let n_votes = votes.len() + 1; // +1 for self
+                let total_nodes = self.cluster.peer_count() + 1;
+                let quorum = total_nodes / 2 + 1;
 
-                if vote_count >= quorum {
-                    info!("Elected as leader for term {}", st.current_term);
-                    // Transition to leader
-                    let last_index = st.log.last_index();
-                    let peer_ids = self.inner.cluster.peer_ids();
-                    let next_index: HashMap<NodeId, LogIndex> =
-                        peer_ids.iter().map(|&id| (id, last_index + 1)).collect();
-                    let match_index: HashMap<NodeId, LogIndex> =
-                        peer_ids.iter().map(|&id| (id, 0)).collect();
-                    st.role = Role::Leader {
-                        next_index,
-                        match_index,
-                        last_heartbeat: Instant::now(),
+                if n_votes >= quorum {
+                    info!(
+                        "Elected leader for term {} ({}/{} votes)",
+                        self.state.current_term, n_votes, total_nodes
+                    );
+                    let last_index = self.state.log.last_index();
+                    let peer_ids = self.cluster.peer_ids();
+                    self.state.role = Role::Leader {
+                        next_index: peer_ids.iter().map(|&id| (id, last_index + 1)).collect(),
+                        match_index: peer_ids.iter().map(|&id| (id, 0)).collect(),
+                        last_heartbeat: Instant::now()
+                            - HEARTBEAT_INTERVAL, // force immediate heartbeat
                     };
+                    self.update_pub_state();
+                    // Immediately send heartbeats to assert leadership
+                    self.replicate_to_all();
                 }
             }
         }
     }
 
-    fn handle_append_entries(&self, from: NodeId, ae: AppendEntries) {
-        let mut st = self.inner.state.lock();
-
-        if ae.term < st.current_term {
-            let reply = Message::AppendEntriesReply(AppendEntriesReply {
-                term: st.current_term,
+    fn on_append_entries(&mut self, from: NodeId, ae: AppendEntries) {
+        if ae.term < self.state.current_term {
+            let reply = AppendEntriesReply {
+                term: self.state.current_term,
                 success: false,
-                match_index: st.log.last_index(),
-            });
-            drop(st);
-            self.inner.cluster.send(from, reply);
+                match_index: self.state.log.last_index(),
+            };
+            self.cluster.send(from, Message::AppendEntriesReply(reply));
             return;
         }
 
-        if ae.term > st.current_term {
-            st.become_follower(ae.term, Some(ae.leader_id));
-        } else if let Role::Follower { leader, election_deadline, .. } = &mut st.role {
-            *leader = Some(ae.leader_id);
-            *election_deadline = random_election_deadline();
+        if ae.term > self.state.current_term {
+            self.state.become_follower(ae.term, Some(ae.leader_id));
         } else {
-            // We were a candidate and received AE from a valid leader
-            st.become_follower(ae.term, Some(ae.leader_id));
+            // Reset election timer and record leader
+            if let Role::Follower { ref mut leader, ref mut election_deadline } = self.state.role {
+                *leader = Some(ae.leader_id);
+                *election_deadline = random_deadline();
+            } else {
+                // We were a candidate; step down
+                self.state.become_follower(ae.term, Some(ae.leader_id));
+            }
         }
 
-        let success = st.log.append_leader_entries(
+        let entry_count = ae.entries.len();
+        let success = self.state.log.append_leader_entries(
             ae.prev_log_index,
             ae.prev_log_term,
             ae.entries,
         );
 
-        let match_idx = if success { st.log.last_index() } else { 0 };
-
-        if success && ae.leader_commit > st.commit_index {
-            st.commit_index = ae.leader_commit.min(st.log.last_index());
-            self.advance_applied(&mut st);
-        }
-
-        let reply = Message::AppendEntriesReply(AppendEntriesReply {
-            term: st.current_term,
-            success,
-            match_index: match_idx,
-        });
-        drop(st);
-        self.inner.cluster.send(from, reply);
-    }
-
-    fn handle_append_entries_reply(&self, from: NodeId, aer: AppendEntriesReply) {
-        let mut st = self.inner.state.lock();
-
-        if aer.term > st.current_term {
-            st.become_follower(aer.term, None);
-            return;
-        }
-
-        // Snapshot log info before entering mutable role borrow
-        let last_log_index = st.log.last_index();
-        let current_term = st.current_term;
-
-        if let Role::Leader { ref mut next_index, ref mut match_index, .. } = st.role {
-            if aer.success {
-                match_index.insert(from, aer.match_index);
-                next_index.insert(from, aer.match_index + 1);
-
-                // Clone match_index to release partial borrow before calling helpers
-                let match_index_snapshot: HashMap<NodeId, LogIndex> = match_index.clone();
-                drop(st); // release lock before re-acquiring in quorum_match_index
-
-                // Re-acquire to update commit_index
-                let mut st = self.inner.state.lock();
-                let new_commit = self.quorum_match_index(&match_index_snapshot, last_log_index);
-                if new_commit > st.commit_index
-                    && st.log.term_at(new_commit) == Some(current_term)
-                {
-                    st.commit_index = new_commit;
-                    self.advance_applied(&mut st);
-                }
-            } else {
-                // Follower rejected — back up next_index
-                let ni = next_index.entry(from).or_insert(1);
-                *ni = (*ni).saturating_sub(1).max(1);
-                if aer.match_index + 1 < *ni {
-                    *ni = aer.match_index + 1;
-                }
+        if success && ae.leader_commit > self.state.commit_index {
+            self.state.commit_index = ae.leader_commit.min(self.state.log.last_index());
+            let applied = self.state.advance_applied();
+            for e in applied {
+                let _ = self.apply_tx.send(e);
             }
         }
+
+        self.update_pub_state();
+
+        let reply = AppendEntriesReply {
+            term: self.state.current_term,
+            success,
+            match_index: if success { self.state.log.last_index() } else { 0 },
+        };
+        self.cluster.send(from, Message::AppendEntriesReply(reply));
     }
 
-    fn handle_forwarded_request(&self, from: NodeId, request_id: u64, op: FileOp) {
-        let mut st = self.inner.state.lock();
-        if !st.is_leader() {
-            let result = FileOpResult::Error("not leader".into());
-            let reply = Message::ClientResponse { request_id, result };
-            drop(st);
-            self.inner.cluster.send(from, reply);
+    fn on_append_entries_reply(&mut self, from: NodeId, aer: AppendEntriesReply) {
+        if aer.term > self.state.current_term {
+            self.state.become_follower(aer.term, None);
+            self.update_pub_state();
             return;
         }
 
-        let index = st.log.last_index() + 1;
+        // Snapshot values we'll need after releasing the role borrow
+        let last_index = self.state.log.last_index();
+        let current_term = self.state.current_term;
+        let mut should_replicate = false;
+
+        if let Role::Leader { ref mut next_index, ref mut match_index, .. } = self.state.role {
+            if aer.success {
+                let new_match = aer.match_index;
+                let old_match = match_index.get(&from).copied().unwrap_or(0);
+
+                if new_match > old_match {
+                    match_index.insert(from, new_match);
+                    next_index.insert(from, new_match + 1);
+                }
+
+                // Advance commit_index if a new majority point is reached
+                let mut mi_vals: Vec<LogIndex> = match_index.values().copied().collect();
+                mi_vals.push(last_index); // leader itself has all entries
+                mi_vals.sort_unstable();
+                let quorum_idx = mi_vals[mi_vals.len() / 2]; // upper half of sorted = majority
+
+                if quorum_idx > self.state.commit_index
+                    && self.state.log.term_at(quorum_idx) == Some(current_term)
+                {
+                    self.state.commit_index = quorum_idx;
+                    let applied = self.state.advance_applied();
+                    for e in applied {
+                        let _ = self.apply_tx.send(e);
+                    }
+                }
+            } else {
+                // Peer rejected — back up next_index and retry immediately
+                let ni = next_index.entry(from).or_insert(1);
+                if aer.match_index + 1 < *ni {
+                    *ni = (aer.match_index + 1).max(1);
+                } else {
+                    *ni = (*ni).saturating_sub(1).max(1);
+                }
+                should_replicate = true;
+            }
+        }
+
+        if should_replicate {
+            self.send_append_entries_to(from);
+        }
+    }
+
+    fn on_forwarded_request(&mut self, from: NodeId, request_id: u64, op: FileOp) {
+        if !self.state.is_leader() {
+            let result = FileOpResult::Error("not leader".into());
+            self.cluster.send(from, Message::ClientResponse { request_id, result });
+            return;
+        }
+
+        let idx = self.state.log.last_index() + 1;
         let entry = LogEntry {
-            index,
-            term: st.current_term,
+            index: idx,
+            term: self.state.current_term,
             request_id,
             client_node: from,
             op,
         };
-        st.log.append(entry);
+        self.state.log.append(entry);
 
-        // We need to send the response when this entry commits.
-        // Store a callback keyed by log index.
-        // For forwarded requests, we respond via the network.
-        // We use a local oneshot and a spawned task that awaits it.
+        // Track this so we can respond when it commits
         let (tx, rx) = oneshot::channel::<FileOpResult>();
-        st.pending.push(Pending { index, tx });
-        drop(st);
+        self.state.pending.push((idx, tx));
 
-        let cluster = self.inner.cluster.clone();
+        // Respond to the originating node when the entry commits
+        let cluster = self.cluster.clone();
         tokio::spawn(async move {
             if let Ok(result) = rx.await {
-                let msg = Message::ClientResponse { request_id, result };
-                cluster.send(from, msg);
+                cluster.send(from, Message::ClientResponse { request_id, result });
             }
         });
 
         self.replicate_to_all();
     }
 
-    fn handle_client_response(&self, _request_id: u64, _result: FileOpResult) {
-        // Responses to forwarded requests are handled by dedicated tasks.
-        // This path is unused in the current design but kept for extensibility.
+    // ── Election ──────────────────────────────────────────────────────────
+
+    fn start_election(&mut self) {
+        self.state.current_term += 1;
+        let term = self.state.current_term;
+        let my_id = self.cluster.local_id;
+
+        let mut votes = HashSet::new();
+        votes.insert(my_id);
+        self.state.voted_for = Some(my_id);
+        self.state.role = Role::Candidate {
+            votes,
+            election_deadline: random_deadline(),
+        };
+        self.update_pub_state();
+
+        info!("Starting election for term {}", term);
+
+        self.cluster.broadcast(Message::RequestVote(RequestVote {
+            term,
+            candidate_id: my_id,
+            last_log_index: self.state.log.last_index(),
+            last_log_term: self.state.log.last_term(),
+        }));
+    }
+
+    // ── Replication ───────────────────────────────────────────────────────
+
+    /// Send AppendEntries (or heartbeat) to all peers in parallel.
+    fn replicate_to_all(&self) {
+        if let Role::Leader { ref next_index, .. } = self.state.role {
+            let peers: Vec<NodeId> = next_index.keys().copied().collect();
+            for peer in peers {
+                self.send_append_entries_to(peer);
+            }
+        }
+    }
+
+    fn send_append_entries_to(&self, peer: NodeId) {
+        let (prev_index, entries) = if let Role::Leader { ref next_index, .. } = self.state.role {
+            let ni = *next_index.get(&peer).unwrap_or(&1);
+            let prev = ni.saturating_sub(1);
+            let entries = self.state.log.entries_from(prev);
+            // Cap at MAX_ENTRIES_PER_RPC to limit per-message size
+            let entries = if entries.len() > MAX_ENTRIES_PER_RPC {
+                entries[..MAX_ENTRIES_PER_RPC].to_vec()
+            } else {
+                entries
+            };
+            (prev, entries)
+        } else {
+            return;
+        };
+
+        let prev_term = self.state.log.term_at(prev_index).unwrap_or(0);
+        let ae = AppendEntries {
+            term: self.state.current_term,
+            leader_id: self.cluster.local_id,
+            prev_log_index: prev_index,
+            prev_log_term: prev_term,
+            entries,
+            leader_commit: self.state.commit_index,
+        };
+        self.cluster.send(peer, Message::AppendEntries(ae));
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
 
-    /// Find the highest log index replicated on a quorum of nodes.
-    fn quorum_match_index(
-        &self,
-        match_index: &HashMap<NodeId, LogIndex>,
-        leader_last: LogIndex,
-    ) -> LogIndex {
-        let mut indices: Vec<LogIndex> = match_index.values().copied().collect();
-        indices.push(leader_last); // leader has all entries
-        indices.sort_unstable();
-        let quorum = (indices.len() + 1) / 2;
-        indices[indices.len() - quorum]
-    }
-
-    /// Advance last_applied up to commit_index and fire pending callbacks.
-    fn advance_applied(&self, st: &mut RaftState) {
-        while st.last_applied < st.commit_index {
-            st.last_applied += 1;
-            let entry = st.log.get(st.last_applied).cloned();
-            if let Some(entry) = entry {
-                let _ = self.inner.apply_tx.send(entry.clone());
-
-                // Resolve any pending proposal for this index (drain to consume tx)
-                let mut remaining = Vec::new();
-                for p in st.pending.drain(..) {
-                    if p.index == entry.index {
-                        let _ = p.tx.send(FileOpResult::Ok);
-                    } else {
-                        remaining.push(p);
-                    }
-                }
-                st.pending = remaining;
-            }
-        }
-    }
-
-    /// Send AppendEntries (or heartbeat) to all peers.
-    fn replicate_to_all(&self) {
-        let st = self.inner.state.lock();
-        if let Role::Leader { ref next_index, .. } = st.role {
-            let peers: Vec<NodeId> = next_index.keys().copied().collect();
-            for peer_id in peers {
-                self.send_append_entries_to(&st, peer_id);
-            }
-        }
-    }
-
-    fn send_append_entries_to(&self, st: &RaftState, peer_id: NodeId) {
-        let ni = match &st.role {
-            Role::Leader { next_index, .. } => *next_index.get(&peer_id).unwrap_or(&1),
-            _ => return,
-        };
-
-        let prev_index = ni.saturating_sub(1);
-        let prev_term = st.log.term_at(prev_index).unwrap_or(0);
-        let entries = st.log.entries_from(prev_index);
-
-        let ae = AppendEntries {
-            term: st.current_term,
-            leader_id: self.inner.cluster.local_id,
-            prev_log_index: prev_index,
-            prev_log_term: prev_term,
-            entries,
-            leader_commit: st.commit_index,
-        };
-        self.inner.cluster.send(peer_id, Message::AppendEntries(ae));
-    }
-
-    // ── Ticker ────────────────────────────────────────────────────────────
-
-    async fn run_ticker(&self) {
-        let mut interval = time::interval(Duration::from_millis(10));
-        loop {
-            interval.tick().await;
-            self.tick();
-        }
-    }
-
-    fn tick(&self) {
-        let now = Instant::now();
-        let mut st = self.inner.state.lock();
-
-        match &st.role.clone() {
-            Role::Follower { election_deadline, .. } => {
-                if now >= *election_deadline {
-                    self.start_election(&mut st);
-                }
-            }
-            Role::Candidate { election_deadline, .. } => {
-                if now >= *election_deadline {
-                    // Restart election
-                    self.start_election(&mut st);
-                }
-            }
-            Role::Leader { last_heartbeat, .. } => {
-                if now.duration_since(*last_heartbeat) >= HEARTBEAT_INTERVAL {
-                    if let Role::Leader { ref mut last_heartbeat, ref next_index, .. } = st.role {
-                        *last_heartbeat = now;
-                        let peers: Vec<NodeId> = next_index.keys().copied().collect();
-                        drop(st); // unlock before sending
-                        let st2 = self.inner.state.lock();
-                        for peer_id in peers {
-                            self.send_append_entries_to(&st2, peer_id);
-                        }
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    fn start_election(&self, st: &mut RaftState) {
-        st.current_term += 1;
-        let term = st.current_term;
-        let my_id = self.inner.cluster.local_id;
-        let last_log_index = st.log.last_index();
-        let last_log_term = st.log.last_term();
-
-        let mut votes = HashSet::new();
-        votes.insert(my_id); // vote for self
-
-        st.voted_for = Some(my_id);
-        st.role = Role::Candidate {
-            votes,
-            election_deadline: random_election_deadline(),
-        };
-
-        info!("Starting election for term {}", term);
-
-        let rv = RequestVote {
-            term,
-            candidate_id: my_id,
-            last_log_index,
-            last_log_term,
-        };
-        drop(st);
-        self.inner.cluster.broadcast(Message::RequestVote(rv));
+    fn update_pub_state(&self) {
+        let mut ps = self.pub_state.write();
+        ps.is_leader = self.state.is_leader();
+        ps.leader_id = self.state.leader_id();
+        ps.current_term = self.state.current_term;
     }
 }

@@ -14,8 +14,8 @@ tinycfs combines a FUSE-based virtual filesystem with cluster membership and con
 │                                                                  │
 │   ┌─────────────┐    ┌────────────────────────────────────────┐ │
 │   │ FUSE layer  │    │           Raft Consensus                │ │
-│   │  (fuser)    │───►│  leader election + log replication     │ │
-│   │             │◄───│  leader election + log replication     │ │
+│   │  (fuser)    │───►│  actor model, proposal batching,       │ │
+│   │             │◄───│  parallel per-peer replication         │ │
 │   └─────────────┘    └───────────────┬────────────────────────┘ │
 │                                      │ committed entries         │
 │   ┌─────────────────────────────────▼────────────────────────┐  │
@@ -37,11 +37,24 @@ tinycfs combines a FUSE-based virtual filesystem with cluster membership and con
 | Concern | Approach |
 |---|---|
 | **Consensus** | Raft (leader election + log replication) — strong consistency with majority quorum |
+| **Throughput** | Actor-model Raft engine (no Mutex contention) + proposal batching (up to 256 ops per RPC) |
+| **Scalability** | Per-peer parallel replication — slow nodes don't stall others; O(N) leader fan-out |
 | **Quorum** | Majority quorum (⌊N/2⌋ + 1 nodes must acknowledge a write) |
+| **Reads** | Served directly from local in-memory store — no network round-trip |
 | **Filesystem** | FUSE via the `fuser` crate; inode-based in-memory tree |
-| **Transport** | Direct TCP with 4-byte length-prefixed `bincode` frames |
+| **Transport** | Direct TCP with 4-byte length-prefixed `bincode` frames; persistent connections |
 | **Small files** | All file data kept in memory; optimised for config/state files |
 | **Config** | JSON (`tinycfs.conf`); no XML, no INI |
+
+### Throughput model
+
+| Cluster size | Expected write throughput | Notes |
+|---|---|---|
+| 3–10 nodes | ~20 000 writes/s | 1 ms batch window, 1 Gbit LAN |
+| 10–100 nodes | ~5 000–10 000 writes/s | O(N) fan-out, parallel senders |
+| 100–500 nodes | ~1 000–5 000 writes/s | Hierarchical relay planned (not yet implemented) |
+
+Reads are local and scale linearly with hardware; they add zero cluster load.
 
 ---
 

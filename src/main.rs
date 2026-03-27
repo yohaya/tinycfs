@@ -10,7 +10,7 @@ use std::sync::Arc;
 use clap::Parser;
 use parking_lot::RwLock;
 use tokio::runtime::Handle;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
@@ -42,7 +42,7 @@ struct Args {
     allow_other: bool,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() {
     // ── Logging ───────────────────────────────────────────────────────────
     tracing_subscriber::fmt()
@@ -70,33 +70,36 @@ async fn main() {
     let (cluster_handle, _cluster) = cluster::Cluster::start(config.clone()).await;
 
     // ── Consensus engine ──────────────────────────────────────────────────
-    let (consensus, mut apply_rx) = Consensus::new(cluster_handle.clone());
-    consensus.start();
+    // `msg_tx`: pipe all incoming cluster messages here.
+    // `apply_rx`: committed log entries in order, for the state machine.
+    let (consensus, mut apply_rx, msg_tx) = Consensus::new(cluster_handle.clone());
 
-    // ── Filesystem state machine ──────────────────────────────────────────
-    let store: Arc<RwLock<FileStore>> = Arc::new(RwLock::new(FileStore::new()));
-
-    // Apply committed Raft entries to the local filesystem state.
-    let store2 = store.clone();
-    tokio::spawn(async move {
-        while let Some(entry) = apply_rx.recv().await {
-            let mut st = store2.write();
-            if let Err(e) = st.apply(&entry.op) {
-                // Log but don't crash; idempotent operations may produce benign errors.
-                tracing::warn!("State machine apply error: {}", e);
-            }
-        }
-    });
-
-    // ── Message dispatch ──────────────────────────────────────────────────
-    let consensus2 = consensus.clone();
+    // ── Forward incoming cluster messages to the Raft actor ───────────────
     let rx_in = cluster_handle.rx_in.clone();
     tokio::spawn(async move {
         loop {
             let env = rx_in.lock().await.recv().await;
             match env {
-                Some(envelope) => consensus2.handle_message(envelope.from, envelope.msg),
+                Some(envelope) => {
+                    if msg_tx.send(envelope).await.is_err() {
+                        break; // Raft actor shut down
+                    }
+                }
                 None => break,
+            }
+        }
+    });
+
+    // ── Filesystem state machine ──────────────────────────────────────────
+    let store: Arc<RwLock<FileStore>> = Arc::new(RwLock::new(FileStore::new()));
+
+    // Apply committed Raft entries to the local in-memory inode tree.
+    let store2 = store.clone();
+    tokio::spawn(async move {
+        while let Some(entry) = apply_rx.recv().await {
+            let mut st = store2.write();
+            if let Err(e) = st.apply(&entry.op) {
+                warn!("State machine apply error: {}", e);
             }
         }
     });
@@ -122,7 +125,8 @@ async fn main() {
 
     info!("Mounting filesystem at {:?}", mountpoint);
 
-    // Mount FUSE in a blocking thread so the tokio runtime keeps running.
+    // Run FUSE in a dedicated blocking thread; the tokio runtime continues on
+    // other threads serving the cluster and consensus tasks.
     tokio::task::spawn_blocking(move || {
         if let Err(e) = fuser::mount2(filesystem, &mountpoint, &fuse_opts) {
             error!("FUSE mount error: {}", e);
