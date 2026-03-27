@@ -1,0 +1,10 @@
+{
+  "cluster_name": "mycluster",
+  "local_node": "node1",
+  "data_dir": "/var/lib/tinycfs",
+  "nodes": [
+    { "name": "node1", "ip": "192.168.1.10", "port": 7788 },
+    { "name": "node2", "ip": "192.168.1.11", "port": 7788 },
+    { "name": "node3", "ip": "192.168.1.12", "port": 7788 }
+  ]
+}

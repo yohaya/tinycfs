@@ -1,0 +1,56 @@
+[package]
+name = "tinycfs"
+version = "0.1.0"
+edition = "2021"
+authors = []
+description = "Tiny Cluster File System - distributed shared filesystem for small files, written in Rust"
+license = "Apache-2.0"
+repository = "https://github.com/yohaya/tinycfs"
+
+[[bin]]
+name = "tinycfs"
+path = "src/main.rs"
+
+[dependencies]
+# FUSE filesystem binding
+fuser = "0.14"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+bytes = "1"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive", "env"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# System / OS
+libc = "0.2"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+sha2 = "0.10"
+
+# Concurrency primitives
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
