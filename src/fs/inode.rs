@@ -1,19 +1,38 @@
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 /// Inode number (1-based; 1 is always the root directory).
 pub type Ino = u64;
 
 /// File type mirroring `fuser::FileType`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InoKind {
     RegularFile,
     Directory,
     Symlink,
 }
 
+// ── SystemTime serde helper ───────────────────────────────────────────────────
+// Serialize as u64 nanoseconds since UNIX_EPOCH for snapshot portability.
+mod serde_systemtime {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    pub fn serialize<S: Serializer>(t: &SystemTime, ser: S) -> Result<S::Ok, S::Error> {
+        let nanos = t.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+        ser.serialize_u64(nanos)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<SystemTime, D::Error> {
+        let nanos = u64::deserialize(de)?;
+        Ok(UNIX_EPOCH + Duration::from_nanos(nanos))
+    }
+}
+
 /// Metadata common to all inode types.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InodeMeta {
     pub ino: Ino,
     pub kind: InoKind,
@@ -21,30 +40,23 @@ pub struct InodeMeta {
     pub uid: u32,
     pub gid: u32,
     pub nlink: u32,
+    #[serde(with = "serde_systemtime")]
     pub atime: SystemTime,
+    #[serde(with = "serde_systemtime")]
     pub mtime: SystemTime,
+    #[serde(with = "serde_systemtime")]
     pub ctime: SystemTime,
 }
 
 impl InodeMeta {
     pub fn new(ino: Ino, kind: InoKind, mode: u32, uid: u32, gid: u32) -> Self {
         let now = SystemTime::now();
-        InodeMeta {
-            ino,
-            kind,
-            mode,
-            uid,
-            gid,
-            nlink: 1,
-            atime: now,
-            mtime: now,
-            ctime: now,
-        }
+        InodeMeta { ino, kind, mode, uid, gid, nlink: 1, atime: now, mtime: now, ctime: now }
     }
 }
 
 /// A directory inode.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirInode {
     pub meta: InodeMeta,
     /// name → child inode number
@@ -52,7 +64,7 @@ pub struct DirInode {
 }
 
 /// A regular file inode.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileInode {
     pub meta: InodeMeta,
     pub data: Vec<u8>,
@@ -65,14 +77,14 @@ impl FileInode {
 }
 
 /// A symbolic link inode.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymlinkInode {
     pub meta: InodeMeta,
     pub target: String,
 }
 
 /// Unified inode container.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Inode {
     File(FileInode),
     Dir(DirInode),

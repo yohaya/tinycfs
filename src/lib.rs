@@ -4,3 +4,4 @@ pub mod config;
 pub mod consensus;
 pub mod error;
 pub mod fs;
+pub mod persistence;

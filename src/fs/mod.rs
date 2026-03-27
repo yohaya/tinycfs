@@ -2,21 +2,20 @@ pub mod inode;
 pub mod store;
 
 use std::ffi::OsStr;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use parking_lot::RwLock;
 use std::sync::Arc;
 use tokio::runtime::Handle;
-use tracing::{debug, warn};
 
 use crate::cluster::message::FileOp;
 use crate::consensus::Consensus;
-use crate::error::to_errno;
-use crate::fs::inode::{to_fuser_attr, to_fuser_type, Inode, InoKind};
+use crate::error::{to_errno, TinyCfsError};
+use crate::fs::inode::{to_fuser_attr, to_fuser_type, Inode};
 use crate::fs::store::{FileStore, ROOT_INO};
 
 /// FUSE filesystem for TinyCFS.
@@ -27,36 +26,31 @@ pub struct TinyCfs {
     handle: Handle,
     consensus: Consensus,
     store: Arc<RwLock<FileStore>>,
+    /// Node name used as part of the lock holder ID.
+    node_name: String,
+    /// Maximum file size in bytes (configurable via Config).
+    max_file_size: u64,
 }
 
 impl TinyCfs {
-    pub fn new(handle: Handle, consensus: Consensus, store: Arc<RwLock<FileStore>>) -> Self {
-        TinyCfs { handle, consensus, store }
+    pub fn new(
+        handle: Handle,
+        consensus: Consensus,
+        store: Arc<RwLock<FileStore>>,
+        node_name: String,
+        max_file_size: u64,
+    ) -> Self {
+        TinyCfs { handle, consensus, store, node_name, max_file_size }
     }
 
-    /// Derive the full path string for a child of `parent` with `name`.
     fn path_for(&self, parent: u64, name: &OsStr) -> Option<String> {
         let name_str = name.to_str()?;
-        let path = self.inode_path(parent, name_str)?;
-        Some(path)
+        Some(self.reconstruct_path(parent, name_str))
     }
 
-    /// Walk upward from inode to construct an absolute path. Simplified O(n)
-    /// implementation — performance is fine for small filesystems.
-    fn inode_path(&self, ino: u64, child_name: &str) -> Option<String> {
-        // Build path component by component
+    fn reconstruct_path(&self, parent_ino: u64, child_name: &str) -> String {
         let store = self.store.read();
-        let mut segments: Vec<String> = vec![child_name.to_string()];
-        // For a simple implementation we track inode → parent via a reverse map.
-        // Since we don't maintain that here, we derive paths by searching.
-        // A proper implementation would maintain a parent pointer.
-        // For now, return /child_name for root children, or use a BFS search.
-        Some(self.reconstruct_path(&store, ino, child_name))
-    }
-
-    fn reconstruct_path(&self, store: &FileStore, parent_ino: u64, child_name: &str) -> String {
-        // Walk up the tree to build an absolute path
-        let parent_path = self.ino_to_path(store, parent_ino);
+        let parent_path = self.ino_to_path(&store, parent_ino);
         if parent_path == "/" {
             format!("/{}", child_name)
         } else {
@@ -68,13 +62,16 @@ impl TinyCfs {
         if ino == ROOT_INO {
             return "/".to_string();
         }
-        // Search all directories for this inode (simplified)
-        // A proper implementation maintains a reverse map
-        self.search_path(store, ROOT_INO, ino, "/")
-            .unwrap_or_else(|| "/".to_string())
+        self.search_path(store, ROOT_INO, ino, "/").unwrap_or_else(|| "/".to_string())
     }
 
-    fn search_path(&self, store: &FileStore, dir_ino: u64, target: u64, prefix: &str) -> Option<String> {
+    fn search_path(
+        &self,
+        store: &FileStore,
+        dir_ino: u64,
+        target: u64,
+        prefix: &str,
+    ) -> Option<String> {
         if let Some(Inode::Dir(dir)) = store.get(dir_ino) {
             for (name, &child_ino) in &dir.entries {
                 let path = if prefix == "/" {
@@ -111,18 +108,17 @@ impl Filesystem for TinyCfs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_str = match name.to_str() {
             Some(s) => s,
-            None => { reply.error(libc::ENOENT); return; }
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
         };
-
         let store = self.store.read();
         match store.lookup(parent, name_str) {
-            Some(ino) => {
-                if let Some(inode) = store.get(ino) {
-                    reply.entry(&TTL, &to_fuser_attr(inode), 0);
-                } else {
-                    reply.error(libc::ENOENT);
-                }
-            }
+            Some(ino) => match store.get(ino) {
+                Some(inode) => reply.entry(&TTL, &to_fuser_attr(inode), 0),
+                None => reply.error(libc::ENOENT),
+            },
             None => reply.error(libc::ENOENT),
         }
     }
@@ -144,7 +140,6 @@ impl Filesystem for TinyCfs {
     }
 
     fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
-        // Stateless open: no file handles tracked
         reply.opened(0, 0);
     }
 
@@ -163,10 +158,10 @@ impl Filesystem for TinyCfs {
         match store.get(ino) {
             Some(Inode::File(f)) => {
                 let offset = offset as usize;
-                let end = (offset + size as usize).min(f.data.len());
                 if offset >= f.data.len() {
                     reply.data(&[]);
                 } else {
+                    let end = (offset + size as usize).min(f.data.len());
                     reply.data(&f.data[offset..end]);
                 }
             }
@@ -177,7 +172,7 @@ impl Filesystem for TinyCfs {
 
     fn write(
         &mut self,
-        req: &Request<'_>,
+        _req: &Request<'_>,
         ino: u64,
         _fh: u64,
         offset: i64,
@@ -187,12 +182,15 @@ impl Filesystem for TinyCfs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
+        // Enforce per-file size limit before proposing.
+        let end = offset as u64 + data.len() as u64;
+        if end > self.max_file_size {
+            reply.error(libc::EFBIG);
+            return;
+        }
+
         let path = self.ino_path(ino);
-        let op = FileOp::Write {
-            path,
-            offset: offset as u64,
-            data: data.to_vec(),
-        };
+        let op = FileOp::Write { path, offset: offset as u64, data: data.to_vec() };
         let consensus = self.consensus.clone();
         let data_len = data.len();
         match self.handle.block_on(consensus.propose(op)) {
@@ -221,37 +219,23 @@ impl Filesystem for TinyCfs {
     ) {
         let path = self.ino_path(ino);
 
-        let atime_secs = atime.map(|t| match t {
+        let to_secs = |t: fuser::TimeOrNow| match t {
             fuser::TimeOrNow::SpecificTime(st) => {
                 st.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
             }
-            fuser::TimeOrNow::Now => {
-                std::time::SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-            }
-        });
-
-        let mtime_secs = mtime.map(|t| match t {
-            fuser::TimeOrNow::SpecificTime(st) => {
-                st.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
-            }
-            fuser::TimeOrNow::Now => {
-                std::time::SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-            }
-        });
+            fuser::TimeOrNow::Now => std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
 
         let op = FileOp::SetAttr {
             path,
             mode,
             uid,
             gid,
-            mtime: mtime_secs,
-            atime: atime_secs,
+            mtime: mtime.map(to_secs),
+            atime: atime.map(to_secs),
             size,
         };
 
@@ -280,18 +264,15 @@ impl Filesystem for TinyCfs {
     ) {
         let path = match self.path_for(parent, name) {
             Some(p) => p,
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
-        let op = FileOp::CreateFile {
-            path,
-            mode: mode & 0o7777,
-            uid: req.uid(),
-            gid: req.gid(),
-        };
+        let op = FileOp::CreateFile { path, mode: mode & 0o7777, uid: req.uid(), gid: req.gid() };
         let consensus = self.consensus.clone();
         match self.handle.block_on(consensus.propose(op)) {
             Ok(()) => {
-                // Find the newly created inode
                 let name_str = name.to_str().unwrap_or("");
                 let store = self.store.read();
                 match store.lookup(parent, name_str).and_then(|ino| store.get(ino)) {
@@ -314,14 +295,13 @@ impl Filesystem for TinyCfs {
     ) {
         let path = match self.path_for(parent, name) {
             Some(p) => p,
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
-        let op = FileOp::CreateDir {
-            path,
-            mode: mode & 0o7777,
-            uid: req.uid(),
-            gid: req.gid(),
-        };
+        let op =
+            FileOp::CreateDir { path, mode: mode & 0o7777, uid: req.uid(), gid: req.gid() };
         let consensus = self.consensus.clone();
         match self.handle.block_on(consensus.propose(op)) {
             Ok(()) => {
@@ -346,18 +326,19 @@ impl Filesystem for TinyCfs {
     ) {
         let path = match self.path_for(parent, link_name) {
             Some(p) => p,
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
         let target_str = match target.to_str() {
             Some(s) => s.to_string(),
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
-        let op = FileOp::CreateSymlink {
-            path,
-            target: target_str,
-            uid: req.uid(),
-            gid: req.gid(),
-        };
+        let op = FileOp::CreateSymlink { path, target: target_str, uid: req.uid(), gid: req.gid() };
         let consensus = self.consensus.clone();
         match self.handle.block_on(consensus.propose(op)) {
             Ok(()) => {
@@ -375,11 +356,13 @@ impl Filesystem for TinyCfs {
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let path = match self.path_for(parent, name) {
             Some(p) => p,
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
-        let op = FileOp::Unlink { path };
         let consensus = self.consensus.clone();
-        match self.handle.block_on(consensus.propose(op)) {
+        match self.handle.block_on(consensus.propose(FileOp::Unlink { path })) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(to_errno(&e)),
         }
@@ -388,11 +371,13 @@ impl Filesystem for TinyCfs {
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let path = match self.path_for(parent, name) {
             Some(p) => p,
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
-        let op = FileOp::Rmdir { path };
         let consensus = self.consensus.clone();
-        match self.handle.block_on(consensus.propose(op)) {
+        match self.handle.block_on(consensus.propose(FileOp::Rmdir { path })) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(to_errno(&e)),
         }
@@ -410,15 +395,20 @@ impl Filesystem for TinyCfs {
     ) {
         let from = match self.path_for(parent, name) {
             Some(p) => p,
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
         let to = match self.path_for(new_parent, new_name) {
             Some(p) => p,
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
-        let op = FileOp::Rename { from, to };
         let consensus = self.consensus.clone();
-        match self.handle.block_on(consensus.propose(op)) {
+        match self.handle.block_on(consensus.propose(FileOp::Rename { from, to })) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(to_errno(&e)),
         }
@@ -439,10 +429,12 @@ impl Filesystem for TinyCfs {
         let store = self.store.read();
         match store.readdir(ino) {
             Ok(entries) => {
-                for (i, (name, child_ino, kind)) in entries.iter().enumerate().skip(offset as usize) {
-                    let ftype = to_fuser_type(&kind);
-                    if reply.add(*child_ino, (i + 1) as i64, ftype, &name) {
-                        break; // buffer full
+                for (i, (name, child_ino, kind)) in
+                    entries.iter().enumerate().skip(offset as usize)
+                {
+                    let ftype = to_fuser_type(kind);
+                    if reply.add(*child_ino, (i + 1) as i64, ftype, name) {
+                        break;
                     }
                 }
                 reply.ok();
@@ -453,14 +445,69 @@ impl Filesystem for TinyCfs {
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
         reply.statfs(
-            /* blocks */ 1_000_000,
-            /* bfree  */ 900_000,
-            /* bavail */ 900_000,
-            /* files  */ 1_000_000,
-            /* ffree  */ 999_000,
-            /* bsize  */ 4096,
-            /* namelen */ 255,
-            /* frsize */ 4096,
+            1_000_000, 900_000, 900_000, 1_000_000, 999_000, 4096, 255, 4096,
         );
+    }
+
+    // ── Distributed file locking ──────────────────────────────────────────
+
+    /// Handles both setlk (non-blocking, sleep=false) and setlkw (blocking, sleep=true).
+    ///
+    /// Whole-file exclusive locking — byte ranges are ignored.
+    /// Lock holder ID = "<node_name>:<lock_owner>" for cluster-uniqueness.
+    fn setlk(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        typ: i32,
+        _pid: u32,
+        sleep: bool,
+        reply: ReplyEmpty,
+    ) {
+        let path = self.ino_path(ino);
+        let holder_id = format!("{}:{}", self.node_name, lock_owner);
+
+        let op = match typ as i32 {
+            x if x == libc::F_UNLCK as i32 => FileOp::ReleaseLock { path, holder_id },
+            x if x == libc::F_RDLCK as i32 || x == libc::F_WRLCK as i32 => {
+                FileOp::AcquireLock { path, holder_id, ttl_secs: 60 }
+            }
+            _ => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        if sleep {
+            // setlkw: block until lock is available or 30 s elapsed.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let consensus = self.consensus.clone();
+            loop {
+                match self.handle.block_on(consensus.propose(op.clone())) {
+                    Ok(()) => {
+                        reply.ok();
+                        return;
+                    }
+                    Err(TinyCfsError::LockContended(_)) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(e) => {
+                        reply.error(to_errno(&e));
+                        return;
+                    }
+                }
+            }
+        } else {
+            // setlk: non-blocking.
+            let consensus = self.consensus.clone();
+            match self.handle.block_on(consensus.propose(op)) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(to_errno(&e)),
+            }
+        }
     }
 }

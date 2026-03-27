@@ -43,6 +43,15 @@ pub enum TinyCfsError {
 
     #[error("Node disconnected: {0}")]
     Disconnected(String),
+
+    /// The file lock is held by another node. Maps to EWOULDBLOCK for non-blocking
+    /// setlk, and triggers a retry loop for blocking setlkw.
+    #[error("Lock contended: held by {0}")]
+    LockContended(String),
+
+    /// File exceeds configured max_file_size_bytes.
+    #[error("File too large (limit: {limit} bytes)")]
+    FileTooLarge { limit: u64 },
 }
 
 impl From<std::io::Error> for TinyCfsError {
@@ -74,8 +83,14 @@ pub fn to_errno(e: &TinyCfsError) -> i32 {
         TinyCfsError::IsDirectory => libc::EISDIR,
         TinyCfsError::NotEmpty => libc::ENOTEMPTY,
         TinyCfsError::InvalidArgument(_) => libc::EINVAL,
-        TinyCfsError::NoQuorum | TinyCfsError::Timeout => libc::EAGAIN,
-        TinyCfsError::NotLeader { .. } => libc::EAGAIN,
+        TinyCfsError::LockContended(_) => libc::EWOULDBLOCK,
+        TinyCfsError::FileTooLarge { .. } => libc::EFBIG,
+        // No quorum / no leader / timeout → filesystem is read-only until a
+        // leader is elected. Return EROFS so callers see a clear "read-only"
+        // signal rather than a transient resource error.
+        TinyCfsError::NoQuorum | TinyCfsError::Timeout | TinyCfsError::NotLeader { .. } => {
+            libc::EROFS
+        }
         _ => libc::EIO,
     }
 }

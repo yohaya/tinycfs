@@ -12,6 +12,11 @@ pub struct NodeConfig {
     /// TCP port for cluster communication (default: 7788).
     #[serde(default = "default_port")]
     pub port: u16,
+    /// If true, this node receives log replication but does NOT vote in
+    /// elections and does NOT count toward quorum. Useful for read-scale
+    /// (observers can serve reads locally with zero write overhead on leader).
+    #[serde(default)]
+    pub observer: bool,
 }
 
 fn default_port() -> u16 {
@@ -24,6 +29,16 @@ impl NodeConfig {
     }
 }
 
+fn default_max_file_size() -> u64 {
+    // 1 MiB — matches pmxcfs default
+    1 * 1024 * 1024
+}
+
+fn default_snapshot_every() -> usize {
+    // Take a snapshot every 10 000 applied entries; compact the log.
+    10_000
+}
+
 /// Top-level tinycfs.conf configuration.
 ///
 /// Example:
@@ -31,6 +46,8 @@ impl NodeConfig {
 /// {
 ///   "cluster_name": "mycluster",
 ///   "local_node": "node1",
+///   "data_dir": "/var/lib/tinycfs",
+///   "max_file_size_bytes": 1048576,
 ///   "nodes": [
 ///     { "name": "node1", "ip": "192.168.1.10", "port": 7788 },
 ///     { "name": "node2", "ip": "192.168.1.11", "port": 7788 },
@@ -44,9 +61,15 @@ pub struct Config {
     pub cluster_name: String,
     /// The name of *this* node — must match one entry in `nodes`.
     pub local_node: String,
-    /// Optional directory for persistent state (raft log, snapshots).
+    /// Directory for persistent state (raft.db). If absent, state is in-memory only.
     #[serde(default)]
     pub data_dir: Option<String>,
+    /// Maximum file size in bytes. Writes exceeding this return EFBIG.
+    #[serde(default = "default_max_file_size")]
+    pub max_file_size_bytes: u64,
+    /// Take a FileStore snapshot (and compact the Raft log) every N applied entries.
+    #[serde(default = "default_snapshot_every")]
+    pub snapshot_every: usize,
     /// List of all nodes in the cluster (including this one).
     pub nodes: Vec<NodeConfig>,
 }
@@ -88,6 +111,16 @@ impl Config {
     pub fn peer_nodes(&self) -> impl Iterator<Item = &NodeConfig> {
         let local = &self.local_node;
         self.nodes.iter().filter(move |n| &n.name != local)
+    }
+
+    /// Total number of voting nodes (excludes observers).
+    pub fn total_voting_nodes(&self) -> usize {
+        self.nodes.iter().filter(|n| !n.observer).count()
+    }
+
+    /// Whether this node is configured as an observer.
+    pub fn is_observer(&self) -> bool {
+        self.local_node_config().map(|n| n.observer).unwrap_or(false)
     }
 
     /// Derive a stable 64-bit node ID from the node name using SHA-256.
