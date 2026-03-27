@@ -25,37 +25,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── Debian 8 (jessie) — glibc 2.19 ────────────────────────────────
-          - name: debian8
-            image: debian:8
-            fix_sources: |
-              sed -i \
-                -e 's|deb.debian.org/debian|archive.debian.org/debian|g' \
-                -e 's|security.debian.org|archive.debian.org/debian-security|g' \
-                -e '/stretch-updates/d' \
-                /etc/apt/sources.list
-              echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check
-
-          # ── Debian 9 (stretch) — glibc 2.24 ────────────────────────────────
-          - name: debian9
-            image: debian:9
-            fix_sources: |
-              sed -i \
-                -e 's|deb.debian.org/debian|archive.debian.org/debian|g' \
-                -e 's|security.debian.org|archive.debian.org/debian-security|g' \
-                -e '/stretch-updates/d' \
-                /etc/apt/sources.list
-              echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check
-
           # ── Ubuntu 22.04 LTS (jammy) — glibc 2.35 ──────────────────────────
           - name: ubuntu22
             image: ubuntu:22.04
-            fix_sources: ""
 
           # ── Ubuntu 24.04 LTS (noble) — glibc 2.38 ──────────────────────────
           - name: ubuntu24
             image: ubuntu:24.04
-            fix_sources: ""
 
     steps:
       # ── Checkout on the host runner (modern Node available) ──────────────
@@ -70,9 +46,6 @@ jobs:
             --env CARGO_TERM_COLOR=always \
             "${{ matrix.image }}" \
             bash -eux -c '
-              # Fix EOL repositories (Debian 8/9)
-              ${{ matrix.fix_sources }}
-
               export DEBIAN_FRONTEND=noninteractive
               apt-get update -qq
               apt-get install -y -qq \
