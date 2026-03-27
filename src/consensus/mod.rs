@@ -265,12 +265,15 @@ impl Consensus {
 fn load_state_from_db(db: &RaftDb, store: &Arc<RwLock<FileStore>>, snapshot_every: u64) -> RaftState {
     let (term, voted_for) = db.load_meta().unwrap_or((0, None));
 
+    // Load the last saved FileStore snapshot.  The Raft log is NOT persisted —
+    // any entries committed after the snapshot will be re-sent by the leader
+    // once this node rejoins the cluster.
     let (snapshot_index, snapshot_term) = match db.load_snapshot() {
         Ok(Some((si, st, data))) => {
             match bincode::deserialize::<FileStore>(&data) {
                 Ok(snap_store) => {
                     *store.write() = snap_store;
-                    info!("Loaded snapshot at index {}", si);
+                    info!("Loaded snapshot at index {} (term {})", si, st);
                 }
                 Err(e) => warn!("Failed to deserialize snapshot: {}", e),
             }
@@ -283,15 +286,14 @@ fn load_state_from_db(db: &RaftDb, store: &Arc<RwLock<FileStore>>, snapshot_ever
         }
     };
 
-    let log_entries = db.load_entries_after(snapshot_index).unwrap_or_default();
+    // Start with an empty in-memory log anchored at the snapshot boundary.
+    // The leader will fill the gap via AppendEntries / InstallSnapshot.
     let mut log = Log::new();
     log.set_snapshot_base(snapshot_index, snapshot_term);
-    for entry in log_entries {
-        log.append(entry);
-    }
+
     info!(
-        "Loaded term={}, voted_for={:?}, log entries after snapshot {}={} entries",
-        term, voted_for, snapshot_index, log.len()
+        "Loaded term={}, voted_for={:?}, starting from snapshot index {}",
+        term, voted_for, snapshot_index
     );
 
     let next_snapshot_at = if snapshot_index == 0 {
@@ -434,12 +436,6 @@ impl RaftEngine {
                 op: proposal.op,
             };
             self.state.next_req_id += 1;
-            // Persist before appending to in-memory log.
-            if let Some(db) = &self.db {
-                if let Err(e) = db.append_entry(&entry) {
-                    warn!("DB: failed to persist log entry {}: {}", idx, e);
-                }
-            }
             self.state.log.append(entry);
             self.state.pending.push((idx, proposal.done));
         }
@@ -582,16 +578,7 @@ impl RaftEngine {
             ae.entries.clone(),
         );
 
-        // Persist new entries.
-        if success && !ae.entries.is_empty() {
-            if let Some(db) = &self.db {
-                for entry in &ae.entries {
-                    if let Err(e) = db.append_entry(entry) {
-                        warn!("DB: persist follower entry {}: {}", entry.index, e);
-                    }
-                }
-            }
-        }
+        // No log persistence — the Raft log is in-memory only.
 
         if success && ae.leader_commit > self.state.commit_index {
             self.state.commit_index =
@@ -701,9 +688,6 @@ impl RaftEngine {
             client_node: from,
             op,
         };
-        if let Some(db) = &self.db {
-            let _ = db.append_entry(&entry);
-        }
         self.state.log.append(entry);
 
         let (tx, rx) = oneshot::channel::<FileOpResult>();
@@ -925,8 +909,6 @@ impl RaftEngine {
         if let Some(db) = &self.db {
             if let Err(e) = db.save_snapshot(is.snapshot_index, is.snapshot_term, &is.data) {
                 warn!("InstallSnapshot: DB save failed: {}", e);
-            } else if let Err(e) = db.compact_log_before(is.snapshot_index) {
-                warn!("InstallSnapshot: DB compact failed: {}", e);
             }
         }
 
@@ -1040,9 +1022,6 @@ impl RaftEngine {
             if let Err(e) = db.save_snapshot(snap_index, snap_term, &data) {
                 warn!("Snapshot save failed: {}", e);
                 return;
-            }
-            if let Err(e) = db.compact_log_before(snap_index) {
-                warn!("Log compaction failed: {}", e);
             }
         }
 
