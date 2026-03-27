@@ -7,9 +7,17 @@ description = "Tiny Cluster File System - distributed shared filesystem for smal
 license = "Apache-2.0"
 repository = "https://github.com/yohaya/tinycfs"
 
+[lib]
+name = "tinycfs"
+path = "src/lib.rs"
+
 [[bin]]
 name = "tinycfs"
 path = "src/main.rs"
+
+[[bin]]
+name = "sim"
+path = "src/bin/sim.rs"
 
 [dependencies]
 # FUSE filesystem binding

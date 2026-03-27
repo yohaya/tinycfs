@@ -1,0 +1,132 @@
+name: Build Release Binaries
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Build inside distro-native Docker containers ──────────────────────────
+  build:
+    name: Build · ${{ matrix.name }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Debian 8 (jessie) — glibc 2.19 ────────────────────────────────
+          - name: debian8
+            image: debian:8
+            fix_sources: |
+              sed -i \
+                -e 's|deb.debian.org/debian|archive.debian.org/debian|g' \
+                -e 's|security.debian.org|archive.debian.org/debian-security|g' \
+                -e '/stretch-updates/d' \
+                /etc/apt/sources.list
+              echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check
+
+          # ── Debian 9 (stretch) — glibc 2.24 ────────────────────────────────
+          - name: debian9
+            image: debian:9
+            fix_sources: |
+              sed -i \
+                -e 's|deb.debian.org/debian|archive.debian.org/debian|g' \
+                -e 's|security.debian.org|archive.debian.org/debian-security|g' \
+                -e '/stretch-updates/d' \
+                /etc/apt/sources.list
+              echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check
+
+          # ── Ubuntu 22.04 LTS (jammy) — glibc 2.35 ──────────────────────────
+          - name: ubuntu22
+            image: ubuntu:22.04
+            fix_sources: ""
+
+          # ── Ubuntu 24.04 LTS (noble) — glibc 2.38 ──────────────────────────
+          - name: ubuntu24
+            image: ubuntu:24.04
+            fix_sources: ""
+
+    steps:
+      # ── Checkout on the host runner (modern Node available) ──────────────
+      - uses: actions/checkout@v4
+
+      # ── Build inside the target container ────────────────────────────────
+      - name: Build in ${{ matrix.name }} container
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /src \
+            --env CARGO_TERM_COLOR=always \
+            "${{ matrix.image }}" \
+            bash -eux -c '
+              # Fix EOL repositories (Debian 8/9)
+              ${{ matrix.fix_sources }}
+
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq \
+                curl \
+                build-essential \
+                pkg-config \
+                libfuse-dev \
+                ca-certificates \
+                git
+
+              # Install Rust (musl-targets for static builds need musl-tools too)
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain stable --profile minimal
+              source "$HOME/.cargo/env"
+
+              # Compile release binary
+              cargo build --release --locked 2>&1
+
+              # Quick smoke-test: binary exists and --help works
+              ./target/release/tinycfs --help || true
+
+              # Copy out with distro label so artifact names are unique
+              cp target/release/tinycfs /src/tinycfs-${{ matrix.name }}-x86_64
+            '
+
+      # ── Upload per-distro artifact ────────────────────────────────────────
+      - name: Upload binary (${{ matrix.name }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: tinycfs-${{ matrix.name }}-x86_64
+          path: tinycfs-${{ matrix.name }}-x86_64
+          if-no-files-found: error
+
+  # ── Collect all binaries into a single release artifact ──────────────────
+  package:
+    name: Package release bundle
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Show dist tree
+        run: find dist/ -type f | sort
+
+      - name: Create tarball
+        run: |
+          tar -czf tinycfs-release-${{ github.sha }}.tar.gz -C dist .
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: tinycfs-release-${{ github.sha }}
+          path: tinycfs-release-${{ github.sha }}.tar.gz

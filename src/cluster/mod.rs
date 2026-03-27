@@ -67,6 +67,17 @@ struct Conn {
     tx: mpsc::UnboundedSender<Message>,
 }
 
+/// Optional cluster configuration that affects runtime behaviour.
+///
+/// Used primarily by the simulation to inject artificial network latency.
+#[derive(Clone, Default)]
+pub struct ClusterOptions {
+    /// If set, each outbound message is delayed by a random duration drawn
+    /// uniformly from [min, max] before being written to the socket.
+    /// Simulates real-world WAN/LAN propagation delay.
+    pub network_delay: Option<(Duration, Duration)>,
+}
+
 /// The cluster manager. Owns all TCP connections.
 pub struct Cluster {
     config: Config,
@@ -80,6 +91,11 @@ pub struct Cluster {
 impl Cluster {
     /// Start the cluster: bind listener, spawn connector tasks, return handle.
     pub async fn start(config: Config) -> (ClusterHandle, Self) {
+        Self::start_with_opts(config, ClusterOptions::default()).await
+    }
+
+    /// Start with explicit options (used by the simulation for delay injection).
+    pub async fn start_with_opts(config: Config, opts: ClusterOptions) -> (ClusterHandle, Self) {
         let local_id = Config::node_id(&config.local_node);
         let local_cfg = config.local_node_config().expect("local node not in config");
 
@@ -99,6 +115,7 @@ impl Cluster {
         let env_tx2 = env_tx.clone();
         let cfg2 = config.clone();
         let lid = local_id;
+        let delay2 = opts.network_delay;
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -108,7 +125,7 @@ impl Cluster {
                         let peers = peers2.clone();
                         let env_tx = env_tx2.clone();
                         let cfg = cfg2.clone();
-                        tokio::spawn(handle_incoming(stream, lid, cfg, conns, peers, env_tx));
+                        tokio::spawn(handle_incoming(stream, lid, cfg, conns, peers, env_tx, delay2));
                     }
                     Err(e) => error!("Accept error: {}", e),
                 }
@@ -142,7 +159,8 @@ impl Cluster {
             let peers = peers.clone();
             let env_tx = env_tx.clone();
             let cfg = config.clone();
-            tokio::spawn(connect_to_peer(peer, lid, cfg, conns, peers, env_tx));
+            let delay = opts.network_delay;
+            tokio::spawn(connect_to_peer(peer, lid, cfg, conns, peers, env_tx, delay));
         }
 
         let handle = ClusterHandle {
@@ -166,6 +184,7 @@ async fn connect_to_peer(
     conns: Arc<RwLock<HashMap<NodeId, Conn>>>,
     peers: Arc<RwLock<HashMap<NodeId, String>>>,
     env_tx: mpsc::UnboundedSender<Envelope>,
+    delay: Option<(Duration, Duration)>,
 ) {
     let peer_id = Config::node_id(&peer.name);
     let mut backoff = Duration::from_millis(500);
@@ -215,7 +234,7 @@ async fn connect_to_peer(
 
                 // Writer task
                 let peer_name2 = peer.name.clone();
-                tokio::spawn(writer_task(write_half, rx, peer_name2));
+                tokio::spawn(writer_task(write_half, rx, peer_name2, delay));
 
                 // Reader task (blocks until connection drops)
                 reader_task(read_half, peer_id, env_tx.clone()).await;
@@ -242,6 +261,7 @@ async fn handle_incoming(
     conns: Arc<RwLock<HashMap<NodeId, Conn>>>,
     peers: Arc<RwLock<HashMap<NodeId, String>>>,
     env_tx: mpsc::UnboundedSender<Envelope>,
+    delay: Option<(Duration, Duration)>,
 ) {
     // Expect Hello
     let (peer_id, peer_name) = match recv_msg(&mut stream).await {
@@ -278,7 +298,7 @@ async fn handle_incoming(
     peers.write().insert(peer_id, peer_name.clone());
 
     // Writer task
-    tokio::spawn(writer_task(write_half, rx, peer_name.clone()));
+    tokio::spawn(writer_task(write_half, rx, peer_name.clone(), delay));
 
     // Reader task
     reader_task(read_half, peer_id, env_tx).await;
@@ -329,14 +349,25 @@ async fn reader_task(
 }
 
 /// Drains a channel and writes messages to the TCP write-half.
+/// If `delay` is Some((min, max)), sleeps for a random duration in that range
+/// before each send — used by the simulation to model network latency.
 async fn writer_task(
     mut write_half: tokio::net::tcp::OwnedWriteHalf,
     mut rx: mpsc::UnboundedReceiver<Message>,
     peer_name: String,
+    delay: Option<(Duration, Duration)>,
 ) {
+    use rand::Rng;
     use tokio::io::AsyncWriteExt;
 
     while let Some(msg) = rx.recv().await {
+        // Inject artificial network delay (simulation only)
+        if let Some((min, max)) = delay {
+            let ms = rand::thread_rng()
+                .gen_range(min.as_millis() as u64..=max.as_millis() as u64);
+            time::sleep(Duration::from_millis(ms)).await;
+        }
+
         let payload = match bincode::serialize(&msg) {
             Ok(p) => p,
             Err(e) => {

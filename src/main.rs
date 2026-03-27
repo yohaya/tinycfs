@@ -1,9 +1,3 @@
-mod cluster;
-mod config;
-mod consensus;
-mod error;
-mod fs;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -13,10 +7,11 @@ use tokio::runtime::Handle;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Config;
-use crate::consensus::Consensus;
-use crate::fs::store::FileStore;
-use crate::fs::TinyCfs;
+use tinycfs::cluster::Cluster;
+use tinycfs::config::Config;
+use tinycfs::consensus::Consensus;
+use tinycfs::fs::store::FileStore;
+use tinycfs::fs::TinyCfs;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -67,7 +62,7 @@ async fn main() {
     );
 
     // ── Cluster networking ────────────────────────────────────────────────
-    let (cluster_handle, _cluster) = cluster::Cluster::start(config.clone()).await;
+    let (cluster_handle, _cluster) = Cluster::start(config.clone()).await;
 
     // ── Consensus engine ──────────────────────────────────────────────────
     // `msg_tx`: pipe all incoming cluster messages here.
