@@ -96,6 +96,20 @@ impl TinyCfs {
         let store = self.store.read();
         self.ino_to_path(&store, ino)
     }
+
+    /// Returns `true` when the cluster is operational and can commit writes.
+    ///
+    /// For Raft: true when this node is the leader, or is a follower that
+    ///           knows the current leader (writes are forwarded).
+    /// For Totem: true when the token ring has a voting quorum.
+    ///
+    /// When false the filesystem is effectively read-only: every mutating
+    /// FUSE operation immediately returns EROFS so that the caller does not
+    /// block for the full 30-second propose() timeout.
+    #[inline]
+    fn cluster_writeable(&self) -> bool {
+        self.consensus.has_quorum()
+    }
 }
 
 const TTL: Duration = Duration::from_secs(1);
@@ -182,6 +196,10 @@ impl Filesystem for TinyCfs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
+        if !self.cluster_writeable() {
+            reply.error(libc::EROFS);
+            return;
+        }
         // Enforce per-file size limit before proposing.
         let end = offset as u64 + data.len() as u64;
         if end > self.max_file_size {
@@ -217,6 +235,10 @@ impl Filesystem for TinyCfs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        if !self.cluster_writeable() {
+            reply.error(libc::EROFS);
+            return;
+        }
         let path = self.ino_path(ino);
 
         let to_secs = |t: fuser::TimeOrNow| match t {
@@ -262,6 +284,10 @@ impl Filesystem for TinyCfs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        if !self.cluster_writeable() {
+            reply.error(libc::EROFS);
+            return;
+        }
         let path = match self.path_for(parent, name) {
             Some(p) => p,
             None => {
@@ -293,6 +319,10 @@ impl Filesystem for TinyCfs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        if !self.cluster_writeable() {
+            reply.error(libc::EROFS);
+            return;
+        }
         let path = match self.path_for(parent, name) {
             Some(p) => p,
             None => {
@@ -324,6 +354,10 @@ impl Filesystem for TinyCfs {
         target: &std::path::Path,
         reply: ReplyEntry,
     ) {
+        if !self.cluster_writeable() {
+            reply.error(libc::EROFS);
+            return;
+        }
         let path = match self.path_for(parent, link_name) {
             Some(p) => p,
             None => {
@@ -354,6 +388,10 @@ impl Filesystem for TinyCfs {
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if !self.cluster_writeable() {
+            reply.error(libc::EROFS);
+            return;
+        }
         let path = match self.path_for(parent, name) {
             Some(p) => p,
             None => {
@@ -369,6 +407,10 @@ impl Filesystem for TinyCfs {
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if !self.cluster_writeable() {
+            reply.error(libc::EROFS);
+            return;
+        }
         let path = match self.path_for(parent, name) {
             Some(p) => p,
             None => {
@@ -393,6 +435,10 @@ impl Filesystem for TinyCfs {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
+        if !self.cluster_writeable() {
+            reply.error(libc::EROFS);
+            return;
+        }
         let from = match self.path_for(parent, name) {
             Some(p) => p,
             None => {
@@ -468,6 +514,10 @@ impl Filesystem for TinyCfs {
         sleep: bool,
         reply: ReplyEmpty,
     ) {
+        if !self.cluster_writeable() {
+            reply.error(libc::EROFS);
+            return;
+        }
         let path = self.ino_path(ino);
         let holder_id = format!("{}:{}", self.node_name, lock_owner);
 

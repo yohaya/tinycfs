@@ -66,7 +66,7 @@ impl FileStore {
             mtime: SystemTime::now(),
             ctime: SystemTime::now(),
         };
-        inodes.insert(ROOT_INO, Inode::Dir(DirInode { meta: root_meta, entries: HashMap::new() }));
+        inodes.insert(ROOT_INO, Inode::Dir(DirInode { meta: root_meta, parent_ino: ROOT_INO, entries: HashMap::new() }));
         FileStore { inodes, next_ino: 2, locks: HashMap::new() }
     }
 
@@ -95,7 +95,7 @@ impl FileStore {
             Some(Inode::Dir(dir)) => {
                 let mut entries = vec![
                     (".".into(), ino, InoKind::Directory),
-                    ("..".into(), ino, InoKind::Directory),
+                    ("..".into(), dir.parent_ino, InoKind::Directory),
                 ];
                 for (name, &child_ino) in &dir.entries {
                     if let Some(child) = self.inodes.get(&child_ino) {
@@ -235,10 +235,14 @@ impl FileStore {
 
     fn create_file(&mut self, path: &str, mode: u32, uid: u32, gid: u32) -> Result<()> {
         let (parent_ino, name) = self.resolve_parent(path)?;
-        if let Some(Inode::Dir(dir)) = self.inodes.get(&parent_ino) {
-            if dir.entries.contains_key(name) {
-                return Err(TinyCfsError::AlreadyExists(name.to_string()));
+        match self.inodes.get(&parent_ino) {
+            Some(Inode::Dir(dir)) => {
+                if dir.entries.contains_key(name) {
+                    return Err(TinyCfsError::AlreadyExists(name.to_string()));
+                }
             }
+            Some(_) => return Err(TinyCfsError::NotDirectory),
+            None => return Err(TinyCfsError::NotFound(format!("inode {}", parent_ino))),
         }
         let ino = self.alloc_ino();
         let meta = InodeMeta::new(ino, InoKind::RegularFile, mode, uid, gid);
@@ -252,15 +256,19 @@ impl FileStore {
 
     fn create_dir(&mut self, path: &str, mode: u32, uid: u32, gid: u32) -> Result<()> {
         let (parent_ino, name) = self.resolve_parent(path)?;
-        if let Some(Inode::Dir(dir)) = self.inodes.get(&parent_ino) {
-            if dir.entries.contains_key(name) {
-                return Err(TinyCfsError::AlreadyExists(name.to_string()));
+        match self.inodes.get(&parent_ino) {
+            Some(Inode::Dir(dir)) => {
+                if dir.entries.contains_key(name) {
+                    return Err(TinyCfsError::AlreadyExists(name.to_string()));
+                }
             }
+            Some(_) => return Err(TinyCfsError::NotDirectory),
+            None => return Err(TinyCfsError::NotFound(format!("inode {}", parent_ino))),
         }
         let ino = self.alloc_ino();
         let mut meta = InodeMeta::new(ino, InoKind::Directory, mode, uid, gid);
         meta.nlink = 2;
-        self.inodes.insert(ino, Inode::Dir(DirInode { meta, entries: HashMap::new() }));
+        self.inodes.insert(ino, Inode::Dir(DirInode { meta, parent_ino, entries: HashMap::new() }));
         if let Some(Inode::Dir(dir)) = self.inodes.get_mut(&parent_ino) {
             dir.entries.insert(name.to_string(), ino);
             dir.meta.mtime = SystemTime::now();
@@ -370,6 +378,12 @@ impl FileStore {
         if let Some(Inode::Dir(dir)) = self.inodes.get_mut(&to_parent) {
             dir.entries.insert(to_name.to_string(), child_ino);
             dir.meta.mtime = SystemTime::now();
+        }
+        // Update parent_ino in the moved inode if it's a directory.
+        if from_parent != to_parent {
+            if let Some(Inode::Dir(child_dir)) = self.inodes.get_mut(&child_ino) {
+                child_dir.parent_ino = to_parent;
+            }
         }
         Ok(())
     }

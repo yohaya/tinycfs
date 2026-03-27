@@ -5,6 +5,7 @@ use clap::Parser;
 use parking_lot::RwLock;
 use tokio::runtime::Handle;
 use tracing::{error, info};
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 use tinycfs::cluster::Cluster;
@@ -13,6 +14,7 @@ use tinycfs::consensus::Consensus;
 use tinycfs::fs::store::FileStore;
 use tinycfs::fs::TinyCfs;
 use tinycfs::persistence::RaftDb;
+use tinycfs::syslog_layer::SyslogLayer;
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -93,10 +95,19 @@ struct Args {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    // ── Logging setup ──────────────────────────────────────────────────────
+    // Two layers:
+    //   1. fmt  — structured stdout/stderr output controlled by RUST_LOG
+    //   2. syslog — WARN/ERROR events forwarded to the system syslog daemon
+    //              (LOG_DAEMON facility), visible in journalctl / /var/log/syslog
+    SyslogLayer::init();
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer().with_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            ),
         )
+        .with(SyslogLayer)
         .init();
 
     let args = Args::parse();
@@ -114,6 +125,23 @@ async fn main() {
         "Starting tinycfs node '{}' in cluster '{}'",
         config.local_node, config.cluster_name
     );
+
+    // Write a structured startup notice to syslog so operators can confirm
+    // the node started with the expected configuration without tailing stdout.
+    let peer_list = config
+        .nodes
+        .iter()
+        .filter(|n| n.name != config.local_node)
+        .map(|n| format!("{}={}:{}", n.name, n.ip, n.port))
+        .collect::<Vec<_>>()
+        .join(", ");
+    SyslogLayer::startup(&format!(
+        "starting node='{}' cluster='{}' mountpoint='{}' peers=[{}]",
+        config.local_node,
+        config.cluster_name,
+        args.mountpoint.display(),
+        peer_list,
+    ));
 
     // ── Persistence (optional) ────────────────────────────────────────────
     let db = if let Some(ref data_dir) = config.data_dir {
@@ -145,8 +173,9 @@ async fn main() {
 
     // ── Consensus engine ──────────────────────────────────────────────────
     // Consensus::new loads snapshot + log from DB (if any) into `store`.
+    info!("Consensus algorithm: {:?}", config.algorithm);
     let (consensus, msg_tx) =
-        Consensus::new(cluster_handle.clone(), db, store.clone(), config.snapshot_every as u64);
+        Consensus::new(config.algorithm.clone(), cluster_handle.clone(), db, store.clone(), config.snapshot_every as u64);
 
     // Forward inbound cluster messages to the Raft actor.
     let rx_in = cluster_handle.rx_in.clone();

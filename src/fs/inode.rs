@@ -59,6 +59,9 @@ impl InodeMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirInode {
     pub meta: InodeMeta,
+    /// Inode number of the parent directory (used for ".." in readdir).
+    /// The root directory points to itself.
+    pub parent_ino: Ino,
     /// name → child inode number
     pub entries: HashMap<String, Ino>,
 }

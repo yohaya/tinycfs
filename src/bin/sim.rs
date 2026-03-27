@@ -24,7 +24,7 @@ use tracing_subscriber::EnvFilter;
 
 use tinycfs::cluster::{Cluster, ClusterOptions};
 use tinycfs::cluster::message::FileOp;
-use tinycfs::config::{Config, NodeConfig};
+use tinycfs::config::{Config, ConsensusAlgorithm, NodeConfig};
 use tinycfs::consensus::Consensus;
 use tinycfs::fs::store::FileStore;
 
@@ -60,6 +60,10 @@ struct Args {
     /// Warm-up period before measuring (seconds).
     #[arg(long, default_value = "3")]
     warmup_secs: u64,
+
+    /// Consensus algorithm: "raft" (default) or "totem".
+    #[arg(long, default_value = "raft")]
+    algorithm: String,
 }
 
 // ─── Per-node handle ──────────────────────────────────────────────────────────
@@ -129,14 +133,20 @@ async fn main() {
 
     let args = Args::parse();
 
+    let algorithm = match args.algorithm.to_lowercase().as_str() {
+        "totem" => ConsensusAlgorithm::Totem,
+        _ => ConsensusAlgorithm::Raft,
+    };
+
     if args.nodes < 3 {
-        eprintln!("ERROR: --nodes must be at least 3 (Raft needs an odd quorum >= 3)");
+        eprintln!("ERROR: --nodes must be at least 3 (consensus needs an odd quorum >= 3)");
         std::process::exit(1);
     }
 
     info!(
-        "Simulation: {} nodes, {} rps, delay {}-{} ms, {} s (+{} s warmup)",
+        "Simulation: {} nodes, algorithm={:?}, {} rps, delay {}-{} ms, {} s (+{} s warmup)",
         args.nodes,
+        algorithm,
         args.rps,
         args.delay_min_ms,
         args.delay_max_ms,
@@ -169,6 +179,7 @@ async fn main() {
             cluster_name: "sim".to_string(),
             local_node: format!("sim-{}", i),
             data_dir: None,
+            algorithm: algorithm.clone(),
             max_file_size_bytes: 64 * 1024, // 64 KiB limit in simulation
             snapshot_every: 50_000,
             nodes: node_configs.clone(),
@@ -179,6 +190,7 @@ async fn main() {
 
         let store = Arc::new(RwLock::new(FileStore::new()));
         let (consensus, msg_tx) = Consensus::new(
+            algorithm.clone(),
             cluster_handle.clone(),
             None,
             store.clone(),

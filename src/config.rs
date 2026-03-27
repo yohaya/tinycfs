@@ -2,6 +2,18 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use crate::error::{Result, TinyCfsError};
 
+/// Consensus algorithm to use for replication.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ConsensusAlgorithm {
+    /// Raft — leader-based, strong consistency, battle-tested default.
+    #[default]
+    Raft,
+    /// Totem SRTP — token-ring total-order multicast as designed in Corosync.
+    /// Any node may propose when it holds the token; no fixed leader.
+    Totem,
+}
+
 /// Configuration for a single cluster node.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct NodeConfig {
@@ -47,6 +59,7 @@ fn default_snapshot_every() -> usize {
 ///   "cluster_name": "mycluster",
 ///   "local_node": "node1",
 ///   "data_dir": "/var/lib/tinycfs",
+///   "algorithm": "raft",
 ///   "max_file_size_bytes": 1048576,
 ///   "nodes": [
 ///     { "name": "node1", "ip": "192.168.1.10", "port": 7788 },
@@ -64,6 +77,9 @@ pub struct Config {
     /// Directory for persistent state (raft.db). If absent, state is in-memory only.
     #[serde(default)]
     pub data_dir: Option<String>,
+    /// Consensus algorithm to use for replication. Default: raft.
+    #[serde(default)]
+    pub algorithm: ConsensusAlgorithm,
     /// Maximum file size in bytes. Writes exceeding this return EFBIG.
     #[serde(default = "default_max_file_size")]
     pub max_file_size_bytes: u64,
@@ -75,11 +91,16 @@ pub struct Config {
 }
 
 impl Config {
-    /// Load configuration from a JSON file.
+    /// Load configuration from a JSON5 or plain JSON file.
+    ///
+    /// JSON5 is a superset of JSON: plain `.conf` and `.json` files are
+    /// accepted automatically.  The parser handles `//` line comments,
+    /// `/* */` block comments, trailing commas, and unquoted keys — all
+    /// of which are used in the shipped `tinycfs.conf.example`.
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| TinyCfsError::Config(format!("cannot read {:?}: {}", path, e)))?;
-        let cfg: Config = serde_json::from_str(&content)
+        let cfg: Config = json5::from_str(&content)
             .map_err(|e| TinyCfsError::Config(format!("parse error in {:?}: {}", path, e)))?;
         cfg.validate()?;
         Ok(cfg)

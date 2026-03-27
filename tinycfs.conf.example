@@ -1,10 +1,266 @@
+// tinycfs.conf.example — fully annotated configuration reference
+//
+// Format: JSON5 (https://json5.org). Comments begin with // or /* */.
+// Copy this file to /etc/tinycfs/tinycfs.conf and edit for your cluster.
+// Override the default path with --config <path> or $TINYCFS_CONF.
+//
+// Backward compatibility: tinycfs also accepts plain JSON files.
+// JSON5 is a superset of JSON — old configs work without changes.
+//
+// Required fields: cluster_name, local_node, nodes
+// All other fields have safe defaults and may be omitted.
+// ─────────────────────────────────────────────────────────────────────────────
+
 {
-  "cluster_name": "mycluster",
-  "local_node": "node1",
-  "data_dir": "/var/lib/tinycfs",
-  "nodes": [
-    { "name": "node1", "ip": "192.168.1.10", "port": 7788 },
-    { "name": "node2", "ip": "192.168.1.11", "port": 7788 },
-    { "name": "node3", "ip": "192.168.1.12", "port": 7788 }
-  ]
+  // ── Identity ──────────────────────────────────────────────────────────────
+
+  // cluster_name  (required)
+  //
+  // A short, human-readable name that identifies this cluster.  All nodes in
+  // the same cluster MUST use an identical value.  A node that receives a Hello
+  // message with a different cluster_name will refuse to connect.
+  //
+  // Rules:     Keep it DNS-safe: letters, digits, hyphens.  No spaces.
+  // Examples:  "prod-storage", "lab-cluster", "pve-eu-west"
+  cluster_name: "mycluster",
+
+  // local_node  (required)
+  //
+  // The name of THIS node.  Must exactly match one "name" entry in the nodes
+  // list below.  Used to derive the stable 64-bit NodeId (first 8 bytes of
+  // SHA-256 of the name) and to look up which IP/port to bind.
+  //
+  // Recommendation: use the machine's short hostname to avoid confusion.
+  local_node: "node1",
+
+
+  // ── Persistent storage ────────────────────────────────────────────────────
+
+  // data_dir  (optional — omit for in-memory-only mode)
+  //
+  // Directory where tinycfs stores its SQLite database (raft.db).
+  // The database persists two things that must survive a power cut:
+  //
+  //   • Raft metadata (current_term, voted_for): prevents double-voting in
+  //     elections, which could split leadership across two nodes.
+  //
+  //   • FileStore snapshot: the entire filesystem state at the last applied
+  //     index.  On restart the node loads this and re-syncs any newer entries
+  //     from the leader instead of replaying the full operation log.
+  //
+  // Without data_dir the node runs in memory only.  On restart it receives a
+  // full filesystem snapshot from the Raft leader, which creates a traffic spike
+  // proportional to filesystem size.  Fine for ephemeral test nodes; avoid in
+  // production.
+  //
+  // Options:
+  //   "/var/lib/tinycfs"   — recommended for production (survives reboots)
+  //   null / omit          — in-memory only; state lost on process exit
+  //
+  // Permissions: the directory is created automatically if it does not exist.
+  //              The tinycfs process must have read+write access.
+  data_dir: "/var/lib/tinycfs",
+
+
+  // ── Consensus algorithm ───────────────────────────────────────────────────
+
+  // algorithm  (optional — default: "raft")
+  //
+  // Which distributed consensus protocol replicates writes across the cluster.
+  //
+  //   "raft"  — Raft (Ongaro & Ousterhout, 2014).
+  //             A single elected leader serialises all writes.  Followers
+  //             replicate in parallel.  Leader election: 700–1400 ms.
+  //             Write latency = 2 × leader_rtt, independent of cluster size.
+  //             Scales well to 20+ nodes.
+  //             Best for: most deployments.  Recommended default.
+  //
+  //   "totem" — Totem SRTP (Amir et al. 1995), as used in Corosync/pmxcfs.
+  //             No fixed leader — a token rotates the ring; each holder sends
+  //             up to 64 messages per turn.  Every ring member must confirm
+  //             receipt before a message is delivered (ARU gate).  Ring
+  //             reform on any failure pauses the cluster ~1.5 s.  Latency
+  //             grows linearly with ring size (1–2 rotations × N × rtt).
+  //             Best for: small clusters (3–7 nodes) where leaderless
+  //             fairness matters, or for pmxcfs-compatible deployments.
+  //
+  // Note: changing algorithm on a running cluster requires a full restart with a
+  // clean data_dir.  The on-disk snapshot format is shared, but sequence number
+  // semantics differ and are not interchangeable.
+  algorithm: "raft",
+
+
+  // ── Availability under cluster problems ───────────────────────────────────
+
+  // When the cluster loses quorum (leader election in progress, network partition,
+  // majority of nodes unreachable) tinycfs automatically switches to read-only
+  // mode: every mutating FUSE operation (write, create, mkdir, unlink, rename,
+  // setattr, symlink, setlk) immediately returns EROFS to the caller instead of
+  // blocking for 30 seconds.
+  //
+  // Read operations (open, read, readdir, getattr, lookup) always succeed from the
+  // local in-memory copy regardless of cluster state.
+  //
+  // This behaviour is always on and is not configurable.  It matches the pmxcfs
+  // model where the filesystem goes read-only on quorum loss, preventing
+  // split-brain writes while keeping existing data accessible.
+  //
+  // Raft:  read-only when no leader is known (election in progress or isolated).
+  // Totem: read-only when the ring cannot form a voting quorum.
+  //
+  // Recovery: writes resume automatically as soon as quorum is restored.
+  // Applications should treat EROFS as a transient error and retry.
+
+
+  // ── File size limit ───────────────────────────────────────────────────────
+
+  // max_file_size_bytes  (optional — default: 1048576 = 1 MiB)
+  //
+  // Maximum size of any single file.  Writes that would push a file beyond this
+  // limit return EFBIG to the FUSE caller (same as a hard quota).  The limit
+  // applies per-file, not to the total filesystem.
+  //
+  // tinycfs is designed for small configuration files (similar use-case to
+  // pmxcfs).  There is no delta encoding: every write replicates the full file
+  // blob over the network.  Large files impose proportionally higher cost on
+  // every cluster member.
+  //
+  // Options (bytes):
+  //    65536     —   64 KiB  (strict; matches simulation default)
+  //   1048576    —    1 MiB  (production default; matches pmxcfs limit)
+  //   5242880    —    5 MiB  (relaxed; only for trusted, fast LANs)
+  //  10485760    —   10 MiB  (maximum recommended; beyond this Raft heartbeat
+  //                           timeouts may occur during large-entry replication)
+  //
+  // Recommendation: leave at 1 MiB unless you store known-large files.
+  max_file_size_bytes: 1048576,
+
+
+  // ── Log compaction / snapshotting ─────────────────────────────────────────
+
+  // snapshot_every  (optional — default: 10000)
+  //
+  // How many applied Raft log entries to accumulate before tinycfs serialises the
+  // full FileStore to SQLite and discards the in-memory log up to that point.
+  //
+  // Snapshotting serves two purposes:
+  //   1. Memory: without it the in-memory log grows indefinitely.
+  //   2. New-node sync speed: a joining follower whose log has fallen behind the
+  //      compaction boundary receives one snapshot instead of thousands of
+  //      individual AppendEntries RPCs.
+  //
+  // Only one snapshot is kept on disk at a time (the latest replaces the previous).
+  //
+  // Trade-offs:
+  //   Smaller value  → more frequent SQLite writes; lower memory usage;
+  //                    faster recovery for very-lagging followers.
+  //   Larger value   → fewer SQLite writes; larger in-memory log; slower sync
+  //                    for nodes that missed many entries.
+  //
+  // Options:
+  //     1000   — aggressive; suitable for NVMe storage with high write throughput
+  //    10000   — balanced default for most deployments
+  //    50000   — low-write workloads on spinning disks
+  //   100000   — maximum recommended; beyond this, rejoin recovery gets slow
+  //
+  // Has no effect on Totem: Totem snapshots on every ring reform (not periodic).
+  snapshot_every: 10000,
+
+
+  // ── Cluster membership ────────────────────────────────────────────────────
+
+  // nodes  (required — at least 3 entries)
+  //
+  // Complete list of ALL nodes in the cluster, including this one.  This list
+  // MUST be byte-for-byte identical on every node.  tinycfs does not support
+  // dynamic membership changes at runtime.  To add or remove a node: update
+  // this file on every machine and do a rolling restart.
+  //
+  // Minimum: 3 nodes (smallest odd quorum).  Even-numbered clusters work but
+  // waste a vote — prefer odd counts: 3, 5, 7 …
+  //
+  // Per-node fields:
+  //
+  //   name  (required)
+  //     Unique node identifier.  NodeId is derived as SHA-256(name)[0..8].
+  //     Must never change after the cluster is formed — changing the name
+  //     generates a different NodeId and the node appears as a stranger.
+  //
+  //   ip  (required)
+  //     IP address this node binds for cluster TCP connections.  Must be
+  //     reachable from all other nodes.  Use the LAN/private address, NOT
+  //     0.0.0.0.  Each node pair maintains exactly one persistent TCP connection
+  //     (the lower-NodeId node initiates).
+  //
+  //   port  (optional — default: 7788)
+  //     TCP port for cluster communication.  Must be open between all nodes in
+  //     both directions.  All nodes may share the same port number.
+  //     Recommended range: 7788 or any unused port above 1024.
+  //
+  //   observer  (optional — default: false)
+  //     If true, this node receives full log replication and can serve local
+  //     FUSE reads with zero network round-trip, but does NOT vote in elections
+  //     and does NOT count toward quorum.  An observer crashing does not
+  //     reduce availability.
+  //
+  //     Use observers for:
+  //       • Read scale-out: add cheap read replicas without changing quorum size.
+  //       • Off-site DR: replicate to a remote data centre without risking
+  //         availability if the WAN link is slow or interrupted.
+  //       • Monitoring / backup nodes that need filesystem visibility.
+  //
+  //     Fault tolerance with observers:
+  //       3 voting + N observers  →  tolerates 1 voting failure (quorum = 2)
+  //       5 voting + N observers  →  tolerates 2 voting failures (quorum = 3)
+  //     Observers themselves are not counted; add more voting nodes to increase
+  //     fault tolerance.
+  nodes: [
+    { name: "node1", ip: "192.168.1.10", port: 7788, observer: false },
+    { name: "node2", ip: "192.168.1.11", port: 7788, observer: false },
+    { name: "node3", ip: "192.168.1.12", port: 7788, observer: false },
+
+    // Example: non-voting observer for read scale-out or DR:
+    // { name: "observer1", ip: "192.168.2.10", port: 7788, observer: true },
+  ],
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QUICK REFERENCE — all fields at a glance
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//  Field                 Type     Default    Required   Valid values
+//  ────────────────────────────────────────────────────────────────────────────
+//  cluster_name          string   —          YES        any non-empty string
+//  local_node            string   —          YES        must match a nodes[].name
+//  data_dir              string   null       no         any writable directory path
+//  algorithm             string   "raft"     no         "raft" | "totem"
+//  max_file_size_bytes   integer  1048576    no         1 – 10485760 (bytes)
+//  snapshot_every        integer  10000      no         100 – 1000000
+//  nodes[].name          string   —          YES        unique, stable identifier
+//  nodes[].ip            string   —          YES        reachable LAN IP address
+//  nodes[].port          integer  7788       no         1024 – 65535
+//  nodes[].observer      bool     false      no         true | false
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// FAULT TOLERANCE vs. CLUSTER SIZE
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//  Voting nodes   Quorum   Tolerated failures
+//  ─────────────────────────────────────────
+//       3           2             1
+//       5           3             2
+//       7           4             3
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// ALGORITHM SELECTION GUIDE
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//  Scenario                                   Recommended
+//  ────────────────────────────────────────────────────────
+//  General production (any cluster size)       raft
+//  High write throughput (> 1000 rps)          raft
+//  Large clusters (> 7 nodes)                  raft
+//  WAN / high-latency inter-node links         raft
+//  Small cluster (3–5 nodes), LAN only         raft  or  totem
+//  Leaderless write fairness required          totem
+//  pmxcfs / Corosync-compatible model          totem

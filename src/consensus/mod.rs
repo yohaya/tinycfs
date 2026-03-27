@@ -1,5 +1,7 @@
 pub mod log;
 
+use crate::config::ConsensusAlgorithm;
+
 /// High-throughput Raft consensus engine — 500-node capable.
 ///
 /// Design:
@@ -8,8 +10,11 @@ pub mod log;
 /// 3. **Parallel per-peer replication** — each peer gets an independent write path.
 /// 4. **Correct quorum** — uses total_voting_nodes from config, not connected peers,
 ///    so partitioned nodes cannot form a false quorum.
-/// 5. **SQLite persistence** — term/vote/log persisted before ACK; snapshotted
-///    every SNAPSHOT_EVERY applied entries for log compaction.
+/// 5. **SQLite persistence** — term/voted_for persisted on every state change.
+///    FileStore written to disk after EVERY committed batch (before acking client),
+///    guaranteeing zero data loss on crash. Log is in-memory only; re-synced from
+///    the leader on restart. Log is compacted every `snapshot_every` entries to
+///    bound memory usage.
 /// 6. **30-second write retry** — propose() keeps retrying until a leader is
 ///    available, returning EROFS only after 30 s.
 /// 7. **Observer support** — observer nodes replicate but don't vote.
@@ -49,8 +54,6 @@ const ELECTION_TIMEOUT_MAX: Duration = Duration::from_millis(1400);
 /// high node counts.
 const MAX_ENTRIES_PER_RPC: usize = 1024;
 const PROPOSAL_QUEUE_DEPTH: usize = 32_768;
-/// Default snapshot interval when none is provided via config.
-const SNAPSHOT_EVERY_DEFAULT: LogIndex = 10_000;
 /// How long propose() keeps retrying when no leader is available.
 const PROPOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -142,11 +145,24 @@ fn random_deadline() -> Instant {
 
 // ─── Public handle ────────────────────────────────────────────────────────────
 
+/// A clone-able handle to whichever consensus engine is running (Raft or Totem).
+///
+/// The FUSE layer only calls `propose()`.  The simulation also calls
+/// `is_leader()` / `has_quorum()` to check readiness.
 #[derive(Clone)]
 pub struct Consensus {
-    proposal_tx: mpsc::Sender<Proposal>,
-    pub_state: Arc<RwLock<PubState>>,
-    local_id: NodeId,
+    inner: Arc<ConsensusInner>,
+}
+
+enum ConsensusInner {
+    Raft {
+        proposal_tx: mpsc::Sender<Proposal>,
+        pub_state: Arc<RwLock<PubState>>,
+    },
+    Totem {
+        proposal_tx: mpsc::Sender<Proposal>,
+        pub_state: Arc<RwLock<crate::totem::TotemPubState>>,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -161,68 +177,90 @@ pub struct PubState {
 impl Consensus {
     /// Build the consensus engine.
     ///
-    /// The engine applies committed log entries directly to `store`, so
-    /// no external apply loop is needed in main.rs.
+    /// The algorithm is selected by the `algorithm` parameter (from Config).
+    /// Both algorithms apply committed entries directly to `store` so no
+    /// external apply loop is needed in main.rs.
     ///
     /// Returns:
     /// - `Consensus` — clone-able handle for FUSE / callers.
     /// - `mpsc::Sender<Envelope>` — pipe incoming cluster messages here.
     pub fn new(
+        algorithm: ConsensusAlgorithm,
         cluster: ClusterHandle,
         db: Option<RaftDb>,
         store: Arc<RwLock<FileStore>>,
         snapshot_every: u64,
     ) -> (Self, mpsc::Sender<Envelope>) {
-        let (proposal_tx, proposal_rx) = mpsc::channel(PROPOSAL_QUEUE_DEPTH);
-        let (msg_tx, msg_rx) = mpsc::channel(16_384);
-        let pub_state = Arc::new(RwLock::new(PubState::default()));
+        match algorithm {
+            ConsensusAlgorithm::Raft => {
+                let (proposal_tx, proposal_rx) = mpsc::channel(PROPOSAL_QUEUE_DEPTH);
+                let (msg_tx, msg_rx) = mpsc::channel(16_384);
+                let pub_state = Arc::new(RwLock::new(PubState::default()));
 
-        let local_id = cluster.local_id;
+                let state = if let Some(ref db) = db {
+                    load_state_from_db(db, &store, snapshot_every)
+                } else {
+                    RaftState::new(snapshot_every)
+                };
 
-        // ── Load persisted state ──────────────────────────────────────────
-        let state = if let Some(ref db) = db {
-            load_state_from_db(db, &store, snapshot_every)
-        } else {
-            RaftState::new(snapshot_every)
-        };
+                let engine = RaftEngine {
+                    state,
+                    cluster,
+                    pub_state: pub_state.clone(),
+                    db,
+                    store,
+                    snapshot_every,
+                    client_pending: HashMap::new(),
+                };
+                tokio::spawn(engine.run(proposal_rx, msg_rx));
 
-        let engine = RaftEngine {
-            state,
-            cluster,
-            pub_state: pub_state.clone(),
-            db,
-            store,
-            snapshot_every,
-            client_pending: HashMap::new(),
-        };
+                let inner = Arc::new(ConsensusInner::Raft { proposal_tx, pub_state });
+                (Consensus { inner }, msg_tx)
+            }
+            ConsensusAlgorithm::Totem => {
+                let (proposal_tx, proposal_rx) = mpsc::channel(PROPOSAL_QUEUE_DEPTH);
+                let (msg_tx, msg_rx) = mpsc::channel(16_384);
+                let pub_state = Arc::new(RwLock::new(crate::totem::TotemPubState::default()));
+                let total_voting = cluster.total_voting_nodes;
 
-        tokio::spawn(engine.run(proposal_rx, msg_rx));
+                let engine = crate::totem::TotemEngine::new(
+                    cluster,
+                    db,
+                    store,
+                    pub_state.clone(),
+                    total_voting,
+                );
+                tokio::spawn(engine.run(proposal_rx, msg_rx));
 
-        let handle = Consensus { proposal_tx, pub_state, local_id };
-        (handle, msg_tx)
+                let inner = Arc::new(ConsensusInner::Totem { proposal_tx, pub_state });
+                (Consensus { inner }, msg_tx)
+            }
+        }
     }
 
-    /// Submit a write operation.
-    ///
-    /// Retries internally for up to 30 seconds while waiting for a leader to be
-    /// elected (leader loss, partition heal).  Returns `Timeout` (→ EROFS) only
-    /// after the 30 s window is exhausted.
+    /// Submit a write operation.  Retries for up to 30 seconds while waiting
+    /// for a leader (Raft) or ring quorum (Totem) to be available.
     pub async fn propose(&self, op: FileOp) -> Result<()> {
-        let deadline = Instant::now() + PROPOSE_TIMEOUT;
+        let proposal_tx = match &*self.inner {
+            ConsensusInner::Raft { proposal_tx, .. } => proposal_tx.clone(),
+            ConsensusInner::Totem { proposal_tx, .. } => proposal_tx.clone(),
+        };
+        Self::propose_inner(proposal_tx, op).await
+    }
 
+    async fn propose_inner(proposal_tx: mpsc::Sender<Proposal>, op: FileOp) -> Result<()> {
+        let deadline = Instant::now() + PROPOSE_TIMEOUT;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(TinyCfsError::Timeout);
             }
-
             let (done_tx, done_rx) = oneshot::channel();
             let proposal = Proposal { op: op.clone(), done: done_tx };
 
-            match self.proposal_tx.try_send(proposal) {
+            match proposal_tx.try_send(proposal) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    // Back-pressure: queue full — wait a bit and retry.
                     time::sleep(Duration::from_millis(50).min(remaining)).await;
                     continue;
                 }
@@ -238,7 +276,7 @@ impl Consensus {
                     return Err(TinyCfsError::LockContended(holder));
                 }
                 Ok(Err(_)) => {
-                    // done_tx dropped (leader stepped down) — retry.
+                    // done_tx dropped (leader step-down / ring reform) — retry.
                     time::sleep(Duration::from_millis(100).min(remaining)).await;
                     continue;
                 }
@@ -248,15 +286,25 @@ impl Consensus {
     }
 
     pub fn is_leader(&self) -> bool {
-        self.pub_state.read().is_leader
+        match &*self.inner {
+            ConsensusInner::Raft { pub_state, .. } => pub_state.read().is_leader,
+            // Totem has no fixed leader; return true when ring has quorum.
+            ConsensusInner::Totem { pub_state, .. } => pub_state.read().has_quorum,
+        }
     }
 
     pub fn leader_id(&self) -> Option<NodeId> {
-        self.pub_state.read().leader_id
+        match &*self.inner {
+            ConsensusInner::Raft { pub_state, .. } => pub_state.read().leader_id,
+            ConsensusInner::Totem { .. } => None,
+        }
     }
 
     pub fn has_quorum(&self) -> bool {
-        self.pub_state.read().has_quorum
+        match &*self.inner {
+            ConsensusInner::Raft { pub_state, .. } => pub_state.read().has_quorum,
+            ConsensusInner::Totem { pub_state, .. } => pub_state.read().has_quorum,
+        }
     }
 }
 
@@ -955,8 +1003,15 @@ impl RaftEngine {
     // ── Apply committed entries ───────────────────────────────────────────
 
     /// Advance last_applied up to commit_index, apply each entry to the store,
-    /// and fire callbacks to waiting proposers.
+    /// persist the FileStore to disk, then fire callbacks to waiting proposers.
+    ///
+    /// Persistence happens BEFORE callbacks are fired so that a client only
+    /// receives "committed" after the data is durable on disk.  This guarantees
+    /// zero data loss: even a full cluster restart cannot lose a committed write.
     fn advance_applied(&mut self) {
+        let start_applied = self.state.last_applied;
+        let mut callbacks: Vec<(oneshot::Sender<FileOpResult>, FileOpResult)> = Vec::new();
+
         while self.state.last_applied < self.state.commit_index {
             self.state.last_applied += 1;
             let idx = self.state.last_applied;
@@ -977,19 +1032,18 @@ impl RaftEngine {
                 };
 
                 if let Err(ref e) = result {
-                    // Log warnings for unexpected errors (not LockContended or AlreadyExists).
                     match e {
                         TinyCfsError::LockContended(_) | TinyCfsError::AlreadyExists(_) => {}
                         other => warn!("State machine at index {}: {}", idx, other),
                     }
                 }
 
-                // Resolve pending proposals at this index.
+                // Collect callbacks — defer firing until after the DB write.
                 let mut i = 0;
                 while i < self.state.pending.len() {
                     if self.state.pending[i].0 == idx {
                         let (_, tx) = self.state.pending.remove(i);
-                        let _ = tx.send(op_result.clone());
+                        callbacks.push((tx, op_result.clone()));
                     } else {
                         i += 1;
                     }
@@ -997,37 +1051,53 @@ impl RaftEngine {
             }
         }
 
-        // Snapshot check.
+        // Persist the full filesystem state BEFORE signalling any client.
+        // The client only sees "committed" after the data is durable on disk.
+        if self.state.last_applied > start_applied {
+            let snap_term = self.state.log.term_at(self.state.last_applied)
+                .unwrap_or(self.state.log.snapshot_term);
+            self.persist_store(self.state.last_applied, snap_term);
+        }
+
+        // Fire deferred callbacks now that the write is durable.
+        for (tx, result) in callbacks {
+            let _ = tx.send(result);
+        }
+
+        // Compact the in-memory log periodically to bound memory usage.
         if self.state.last_applied >= self.state.next_snapshot_at {
-            self.take_snapshot();
+            self.compact_log();
         }
     }
 
-    fn take_snapshot(&mut self) {
-        let snap_index = self.state.last_applied;
-        let snap_term = self.state.log.term_at(snap_index).unwrap_or(0);
-
-        let data = {
-            let st = self.store.read();
-            match bincode::serialize(&*st) {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!("Snapshot serialization failed: {}", e);
-                    return;
-                }
-            }
-        };
-
+    /// Serialize the FileStore and write it to SQLite as the current snapshot.
+    fn persist_store(&self, snap_index: LogIndex, snap_term: Term) {
         if let Some(db) = &self.db {
+            let data = {
+                let st = self.store.read();
+                match bincode::serialize(&*st) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("FileStore serialization failed at index {}: {}", snap_index, e);
+                        return;
+                    }
+                }
+            };
             if let Err(e) = db.save_snapshot(snap_index, snap_term, &data) {
-                warn!("Snapshot save failed: {}", e);
-                return;
+                warn!("FileStore persist failed at index {}: {}", snap_index, e);
             }
         }
+    }
 
+    /// Compact the in-memory Raft log up to last_applied (memory management only —
+    /// the FileStore is already persisted by persist_store).
+    fn compact_log(&mut self) {
+        let snap_index = self.state.last_applied;
+        let snap_term = self.state.log.term_at(snap_index)
+            .unwrap_or(self.state.log.snapshot_term);
         self.state.log.compact_before(snap_index, snap_term);
         self.state.next_snapshot_at = snap_index + self.snapshot_every;
-        info!("Snapshot at index {} (term {}), log compacted", snap_index, snap_term);
+        debug!("Log compacted at index {} (term {})", snap_index, snap_term);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────

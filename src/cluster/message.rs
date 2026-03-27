@@ -162,6 +162,88 @@ pub struct InstallSnapshotReply {
     pub match_index: LogIndex,
 }
 
+// ─── Totem messages ──────────────────────────────────────────────────────────
+
+/// Sequence number type used by the Totem protocol.
+pub type Seq = u64;
+
+/// The Totem token — rotates around the ring granting permission to multicast.
+///
+/// Designed after the Corosync Totem SRTP token structure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TotemToken {
+    /// Monotonically increasing ring ID.  Nodes ignore tokens from old rings.
+    pub ring_id: u64,
+    /// Highest sequence number assigned so far in this ring.
+    pub seq: Seq,
+    /// All-received-up-to: the lowest per-node ARU seen so far on this token
+    /// rotation (minimum across all holders).  Messages with seq ≤ aru are
+    /// guaranteed to have been received by every ring member.
+    pub aru: Seq,
+    /// Globally confirmed delivery point from the PREVIOUS rotation.
+    /// The coordinator sets this after each full ring pass (= the final `aru`
+    /// of the completed rotation, which is the true global minimum).  All other
+    /// nodes pass this value through unchanged.  Every node delivers up to
+    /// `confirmed_aru` — guaranteeing all nodes deliver the same set of messages
+    /// at the same point in the protocol.
+    pub confirmed_aru: Seq,
+    /// Sequence numbers that the last token holder had not yet received and
+    /// is requesting retransmission of.
+    pub rtr_list: Vec<Seq>,
+    /// Number of messages the token sender has waiting to send (backlog).
+    pub backlog: u32,
+    /// Identity of the node that reported the lowest ARU.
+    pub aru_addr: NodeId,
+}
+
+/// An atomic multicast message in the Totem protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TotemMcast {
+    /// Ring this message belongs to.
+    pub ring_id: u64,
+    /// Total-order sequence number assigned by the token holder.
+    pub seq: Seq,
+    /// The node that originated this message.
+    pub sender: NodeId,
+    /// Opaque request ID used to match the delivery callback on the
+    /// originating node.
+    pub request_id: u64,
+    /// The filesystem operation to replicate.
+    pub op: FileOp,
+}
+
+/// Broadcast by any node that wants to form or rejoin a ring.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TotemJoin {
+    /// Proposed ring ID (must be strictly higher than any known ring ID).
+    pub ring_id: u64,
+    /// The set of node IDs the sender proposes for the new ring.
+    pub members: Vec<NodeId>,
+    pub sender: NodeId,
+}
+
+/// Acknowledgement of a TotemJoin proposal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TotemJoinAck {
+    pub ring_id: u64,
+    /// The set of nodes the acknowledging node can reach.
+    pub members: Vec<NodeId>,
+    pub sender: NodeId,
+}
+
+/// Sent by the ring coordinator after forming a new ring to distribute the
+/// current filesystem state and ring membership.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TotemSync {
+    pub ring_id: u64,
+    /// Ordered list of all nodes in the new ring.
+    pub members: Vec<NodeId>,
+    /// Highest sequence number already delivered before this sync point.
+    pub deliver_seq: Seq,
+    /// Serialized `FileStore` snapshot.
+    pub data: Vec<u8>,
+}
+
 // ─── Top-level network message ───────────────────────────────────────────────
 
 /// Every message exchanged between cluster nodes.
@@ -187,6 +269,13 @@ pub enum Message {
     AppendEntriesReply(AppendEntriesReply),
     InstallSnapshot(InstallSnapshot),
     InstallSnapshotReply(InstallSnapshotReply),
+
+    // ── Totem consensus ─────────────────────────────────────────────────────
+    TotemToken(TotemToken),
+    TotemMcast(TotemMcast),
+    TotemJoin(TotemJoin),
+    TotemJoinAck(TotemJoinAck),
+    TotemSync(TotemSync),
 
     // ── Client request forwarding ───────────────────────────────────────────
     /// A follower forwards a write request to the leader.
