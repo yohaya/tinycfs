@@ -2,17 +2,20 @@
 ///
 /// Spawns N in-process cluster nodes on localhost with configurable artificial
 /// network delay, packet loss, and optional network partition injection.
-/// Fires write proposals at a target requests-per-second rate from random
-/// nodes, then reports:
-///   - Throughput and success rate
-///   - Latency percentiles (p50 / p95 / p99)
-///   - Leader election time
-///   - Consistency check: all stores converge to identical state
+/// Fires write proposals at a target RPS rate, then reports throughput,
+/// latency percentiles, leader election time, and a consistency check.
 ///
-/// Usage (see CLAUDE.md):
-///   cargo run --bin sim -- --nodes 100 --rps 5000 --delay-min-ms 5 --delay-max-ms 10
-///   cargo run --bin sim -- --nodes 20 --partition-at-secs 10 --heal-at-secs 20
+/// Benchmark mode (--pre-populate):
+///   Pre-populates the store with N files, then runs the load test.  Use
+///   --snapshot-every 1 to reproduce the old "persist on every write" behaviour
+///   and compare against the default (--snapshot-every 10000).
+///
+/// Usage:
+///   cargo run --bin sim -- --nodes 20 --rps 5000 --delay-min-ms 5 --delay-max-ms 10
+///   cargo run --bin sim -- --nodes 5 --pre-populate 3000 --with-db   # large-store bench
+///   cargo run --bin sim -- --nodes 5 --pre-populate 3000 --with-db --snapshot-every 1  # slow path
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -31,6 +34,7 @@ use tinycfs::cluster::message::{FileOp, NodeId};
 use tinycfs::config::{Config, ConsensusAlgorithm, NodeConfig};
 use tinycfs::consensus::Consensus;
 use tinycfs::fs::store::FileStore;
+use tinycfs::persistence::RaftDb;
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -85,6 +89,29 @@ struct Args {
     /// How many nodes to put in the minority partition (default: half).
     #[arg(long)]
     partition_size: Option<usize>,
+
+    // ── Benchmark / persistence options ────────────────────────────────────
+
+    /// Pre-populate the store with this many files before the load test.
+    /// Used to benchmark performance with a large FileStore.
+    #[arg(long, default_value = "0")]
+    pre_populate: usize,
+
+    /// Override the snapshot_every (log compaction interval) for all nodes.
+    /// Set to 1 to reproduce the old "write full snapshot on every commit"
+    /// behaviour — useful as a before/after benchmark comparison.
+    #[arg(long, default_value = "10000")]
+    snapshot_every: u64,
+
+    /// Override the persist_every (SQLite snapshot write interval) for all nodes.
+    /// Defaults to snapshot_every.  Set to 1 for maximum durability (slow for large stores).
+    #[arg(long)]
+    persist_every: Option<u64>,
+
+    /// Enable per-node SQLite persistence using temporary directories.
+    /// Without this flag nodes run purely in-memory (faster, no I/O overhead).
+    #[arg(long)]
+    with_db: bool,
 }
 
 // ─── Per-node handle ──────────────────────────────────────────────────────────
@@ -92,6 +119,7 @@ struct Args {
 struct SimNode {
     consensus: Consensus,
     store: Arc<RwLock<FileStore>>,
+    db_dir: Option<tempfile::TempDir>,
 }
 
 // ─── Latency histogram (lock-free, microsecond buckets) ───────────────────────
@@ -121,9 +149,7 @@ impl Histogram {
 
     fn percentile(&self, pct: f64) -> Duration {
         let total = self.count.load(Ordering::Relaxed);
-        if total == 0 {
-            return Duration::ZERO;
-        }
+        if total == 0 { return Duration::ZERO; }
         let target = ((total as f64) * pct / 100.0).ceil() as u64;
         let mut acc = 0u64;
         for (i, b) in self.buckets.iter().enumerate() {
@@ -137,9 +163,7 @@ impl Histogram {
 
     fn mean(&self) -> Duration {
         let c = self.count.load(Ordering::Relaxed);
-        if c == 0 {
-            return Duration::ZERO;
-        }
+        if c == 0 { return Duration::ZERO; }
         Duration::from_micros(self.sum_us.load(Ordering::Relaxed) / c)
     }
 }
@@ -149,7 +173,7 @@ impl Histogram {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new("warn,sim=info,tinycfs=debug"))
+        .with_env_filter(EnvFilter::new("warn,sim=info,tinycfs=warn"))
         .init();
 
     let args = Args::parse();
@@ -164,17 +188,17 @@ async fn main() {
         std::process::exit(1);
     }
 
+    let persist_every = args.persist_every.unwrap_or(args.snapshot_every);
+
     info!(
         "Simulation: {} nodes, algorithm={:?}, {} rps, delay {}-{} ms, \
-         packet-loss {:.1}%, duration {} s (+{} s warmup)",
-        args.nodes,
-        algorithm,
-        args.rps,
-        args.delay_min_ms,
-        args.delay_max_ms,
-        args.packet_loss_pct,
-        args.duration_secs,
-        args.warmup_secs,
+         packet-loss {:.1}%, duration {} s (+{} s warmup), \
+         snapshot_every={}, persist_every={}, db={}",
+        args.nodes, algorithm, args.rps,
+        args.delay_min_ms, args.delay_max_ms, args.packet_loss_pct,
+        args.duration_secs, args.warmup_secs,
+        args.snapshot_every, persist_every,
+        if args.with_db { "enabled" } else { "disabled (in-memory)" },
     );
 
     // ── Build per-node configs ─────────────────────────────────────────────
@@ -192,8 +216,7 @@ async fn main() {
         .map(|i| tinycfs::config::Config::node_id(&format!("sim-{}", i)))
         .collect();
 
-    // Each node gets its own ClusterOptions with a distinct blocked_peers Arc
-    // so partitions can be injected per-node without affecting siblings.
+    // Each node gets its own ClusterOptions with a distinct blocked_peers Arc.
     let all_opts: Vec<ClusterOptions> = (0..args.nodes)
         .map(|_| ClusterOptions {
             network_delay: Some((
@@ -209,14 +232,25 @@ async fn main() {
     let mut nodes: Vec<SimNode> = Vec::with_capacity(args.nodes);
 
     for i in 0..args.nodes {
+        // Create temporary DB directory if persistence is enabled.
+        let (db_dir, db) = if args.with_db {
+            let dir = tempfile::TempDir::new().expect("failed to create temp dir for DB");
+            let db_path = dir.path().join("raft.db");
+            let db = RaftDb::open(&db_path).expect("failed to open raft.db");
+            (Some(dir), Some(db))
+        } else {
+            (None, None)
+        };
+
         let config = Config {
             cluster_name: "sim".to_string(),
             local_node: format!("sim-{}", i),
             data_dir: None,
             algorithm: algorithm.clone(),
-            max_file_size_bytes: 64 * 1024,
-            max_fs_size_bytes: 1 * 1024 * 1024 * 1024,
-            snapshot_every: 50_000,
+            max_file_size_bytes: 1 * 1024 * 1024, // 1 MiB per file in sim
+            max_fs_size_bytes: 4 * 1024 * 1024 * 1024,
+            snapshot_every: args.snapshot_every as usize,
+            persist_every: persist_every as usize,
             mountpoint: None,
             noexec: true,
             nosuid: true,
@@ -231,9 +265,10 @@ async fn main() {
         let (consensus, msg_tx) = Consensus::new(
             algorithm.clone(),
             cluster_handle.clone(),
-            None,
+            db,
             store.clone(),
             config.snapshot_every as u64,
+            config.persist_every as u64,
             0, // no per-file size limit in simulation
             0, // no total-fs size limit in simulation
         );
@@ -244,49 +279,77 @@ async fn main() {
             loop {
                 let env = rx_in.lock().await.recv().await;
                 match env {
-                    Some(e) => {
-                        if msg_tx.send(e).await.is_err() {
-                            break;
-                        }
-                    }
+                    Some(e) => { if msg_tx.send(e).await.is_err() { break; } }
                     None => break,
                 }
             }
         });
 
-        nodes.push(SimNode { consensus, store });
+        nodes.push(SimNode { consensus, store, db_dir });
     }
 
     // ── Wait for leader election ───────────────────────────────────────────
-    let warmup = Duration::from_secs(args.warmup_secs);
     info!("Waiting up to {}s for cluster to stabilise…", args.warmup_secs);
-
     let election_timer = Instant::now();
-    let warmup_deadline = time::Instant::now() + warmup;
-    let election_time;
+    let warmup_deadline = time::Instant::now() + Duration::from_secs(args.warmup_secs);
 
-    loop {
+    let election_time = loop {
         if nodes.iter().any(|n| n.consensus.is_leader()) {
-            election_time = election_timer.elapsed();
-            info!("Leader elected in {:.0} ms", election_time.as_millis());
-            break;
+            break election_timer.elapsed();
         }
         if time::Instant::now() >= warmup_deadline {
             eprintln!(
-                "ERROR: No leader elected after {}s — check ports and network settings",
+                "ERROR: No leader elected after {}s — check ports/network settings",
                 args.warmup_secs
             );
             std::process::exit(1);
         }
         time::sleep(Duration::from_millis(10)).await;
+    };
+    info!("Leader elected in {:.0} ms", election_time.as_millis());
+
+    // Finish out warmup.
+    let elapsed = election_timer.elapsed();
+    if elapsed < Duration::from_secs(args.warmup_secs) {
+        time::sleep(Duration::from_secs(args.warmup_secs) - elapsed).await;
     }
 
-    // Wait out any remaining warm-up so connections stabilise.
-    let elapsed = election_timer.elapsed();
-    if elapsed < warmup {
-        time::sleep(warmup - elapsed).await;
-    }
-    info!("Cluster stable. Starting load test…");
+    // ── Pre-population (benchmark mode) ───────────────────────────────────
+    let pre_populate_time = if args.pre_populate > 0 {
+        info!("Pre-populating store with {} files…", args.pre_populate);
+        let t0 = Instant::now();
+        // Use the first node that is (or knows) a leader.
+        let writer = nodes.iter()
+            .find(|n| n.consensus.is_leader() || n.consensus.has_quorum())
+            .map(|n| n.consensus.clone())
+            .unwrap_or_else(|| nodes[0].consensus.clone());
+
+        for i in 0..args.pre_populate {
+            let path = format!("/vm/{}/2024-01-01T00:00:00Z 10GiB", i);
+            let op = FileOp::Write {
+                path,
+                offset: 0,
+                data: format!("vm snapshot entry {} metadata text", i).into_bytes(),
+            };
+            if let Err(e) = writer.propose(op).await {
+                warn!("Pre-populate write {}: {}", i, e);
+            }
+            if (i + 1) % 500 == 0 {
+                info!("  pre-populated {}/{} files", i + 1, args.pre_populate);
+            }
+        }
+        let t = t0.elapsed();
+        let rate = args.pre_populate as f64 / t.as_secs_f64();
+        info!(
+            "Pre-populated {} files in {:.1}s ({:.0} writes/s)",
+            args.pre_populate, t.as_secs_f64(), rate
+        );
+        Some((t, rate))
+    } else {
+        None
+    };
+
+    info!("Starting load test…");
 
     // ── Partition injection ────────────────────────────────────────────────
     let partition_size = args.partition_size.unwrap_or(args.nodes / 2);
@@ -298,31 +361,21 @@ async fn main() {
         let ps = partition_size;
         tokio::spawn(async move {
             time::sleep(Duration::from_secs(at_secs)).await;
-            // Minority: nodes [0..ps] can't talk to majority [ps..n]
             for i in 0..ps {
                 for j in ps..n {
                     opts[i].blocked_peers.write().insert(ids[j]);
                     opts[j].blocked_peers.write().insert(ids[i]);
                 }
             }
-            warn!(
-                "═══ PARTITION at {}s: nodes 0–{} isolated from {}–{} ═══",
-                at_secs,
-                ps - 1,
-                ps,
-                n - 1
-            );
+            warn!("═══ PARTITION at {}s: nodes 0–{} isolated from {}–{} ═══", at_secs, ps-1, ps, n-1);
         });
     }
-
     if let Some(heal_secs) = args.heal_at_secs {
         let opts = all_opts.clone();
         tokio::spawn(async move {
             time::sleep(Duration::from_secs(heal_secs)).await;
-            for opt in &opts {
-                opt.blocked_peers.write().clear();
-            }
-            warn!("═══ PARTITION HEALED at {}s: all nodes communicating ═══", heal_secs);
+            for opt in &opts { opt.blocked_peers.write().clear(); }
+            warn!("═══ PARTITION HEALED at {}s ═══", heal_secs);
         });
     }
 
@@ -358,6 +411,7 @@ async fn main() {
 
         tokio::spawn(async move {
             let t = Instant::now();
+            // Mix writes and creates to exercise different code paths.
             let path = format!("/file-{}.txt", seq % 1000);
             let op = FileOp::Write {
                 path,
@@ -365,20 +419,13 @@ async fn main() {
                 data: format!("seq={}", seq).into_bytes(),
             };
             match consensus.propose(op).await {
-                Ok(()) => {
-                    h.record(t.elapsed());
-                    ok.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    warn!("Proposal error: {}", e);
-                    err.fetch_add(1, Ordering::Relaxed);
-                }
+                Ok(()) => { h.record(t.elapsed()); ok.fetch_add(1, Ordering::Relaxed); }
+                Err(e) => { warn!("Proposal error: {}", e); err.fetch_add(1, Ordering::Relaxed); }
             }
         });
     }
 
     let total_elapsed = start.elapsed();
-
     info!("Load test done. Waiting 2s for final commits to flush…");
     time::sleep(Duration::from_secs(2)).await;
 
@@ -386,25 +433,22 @@ async fn main() {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    let hashes: Vec<u64> = nodes
-        .iter()
-        .map(|n| {
-            let store = n.store.read();
-            let mut h = DefaultHasher::new();
-            let mut paths: Vec<(String, Vec<u8>)> = Vec::new();
-            for key in 0u64..1000 {
-                let path_str = format!("file-{}.txt", key);
-                if let Some(ino) = store.lookup(1, &path_str) {
-                    if let Some(tinycfs::fs::inode::Inode::File(f)) = store.get(ino) {
-                        paths.push((path_str, f.data.clone()));
-                    }
+    let hashes: Vec<u64> = nodes.iter().map(|n| {
+        let store = n.store.read();
+        let mut h = DefaultHasher::new();
+        let mut paths: Vec<(String, Vec<u8>)> = Vec::new();
+        for key in 0u64..1000 {
+            let path_str = format!("file-{}.txt", key);
+            if let Some(ino) = store.lookup(1, &path_str) {
+                if let Some(tinycfs::fs::inode::Inode::File(f)) = store.get(ino) {
+                    paths.push((path_str, f.data.clone()));
                 }
             }
-            paths.sort_by(|a, b| a.0.cmp(&b.0));
-            paths.hash(&mut h);
-            h.finish()
-        })
-        .collect();
+        }
+        paths.sort_by(|a, b| a.0.cmp(&b.0));
+        paths.hash(&mut h);
+        h.finish()
+    }).collect();
 
     let all_same = hashes.windows(2).all(|w| w[0] == w[1]);
 
@@ -419,39 +463,43 @@ async fn main() {
     println!("═══════════════════════════════════════════════════════");
     println!(" tinycfs Simulation Results");
     println!("═══════════════════════════════════════════════════════");
-    println!(" Nodes:           {}", args.nodes);
-    println!(" Algorithm:       {:?}", algorithm);
-    println!(" Network delay:   {}–{} ms (one-way)", args.delay_min_ms, args.delay_max_ms);
-    println!(" Packet loss:     {:.1}%", args.packet_loss_pct);
+    println!(" Nodes:            {}", args.nodes);
+    println!(" Algorithm:        {:?}", algorithm);
+    println!(" Network delay:    {}–{} ms (one-way)", args.delay_min_ms, args.delay_max_ms);
+    println!(" Packet loss:      {:.1}%", args.packet_loss_pct);
+    println!(" Persistence:      {} (snapshot_every={}, persist_every={})",
+        if args.with_db { "SQLite" } else { "in-memory" }, args.snapshot_every, persist_every);
     if let Some(at) = args.partition_at_secs {
-        println!(
-            " Partition:       at {}s (size {}), heal {}",
-            at,
-            partition_size,
-            args.heal_at_secs.map(|h| format!("at {}s", h)).unwrap_or_else(|| "never".into()),
-        );
+        println!(" Partition:        at {}s (size {}), heal {}",
+            at, partition_size,
+            args.heal_at_secs.map(|h| format!("at {}s", h)).unwrap_or_else(|| "never".into()));
     }
-    println!(" Target RPS:      {}", args.rps);
-    println!(" Duration:        {:.1} s", total_elapsed.as_secs_f64());
+    println!(" Target RPS:       {}", args.rps);
+    println!(" Duration:         {:.1} s", total_elapsed.as_secs_f64());
     println!("───────────────────────────────────────────────────────");
-    println!(" Leader elected:  {:.0} ms", election_time.as_millis());
-    println!(" Total ops:       {}", total);
-    println!(" Succeeded:       {}  ({:.2}%)", ok, success_pct);
-    println!(" Failed:          {}", err);
-    println!(" Throughput:      {:.0} ops/s", throughput);
+    if let Some((t, rate)) = pre_populate_time {
+        println!(" Pre-populate:     {} files in {:.1}s ({:.0} writes/s)",
+            args.pre_populate, t.as_secs_f64(), rate);
+    }
+    println!(" Leader elected:   {:.0} ms", election_time.as_millis());
+    println!(" Total ops:        {}", total);
+    println!(" Succeeded:        {}  ({:.2}%)", ok, success_pct);
+    println!(" Failed:           {}", err);
+    println!(" Throughput:       {:.0} ops/s", throughput);
     println!("───────────────────────────────────────────────────────");
-    println!(" Latency p50:     {:.1} ms", hist.percentile(50.0).as_secs_f64() * 1000.0);
-    println!(" Latency p95:     {:.1} ms", hist.percentile(95.0).as_secs_f64() * 1000.0);
-    println!(" Latency p99:     {:.1} ms", hist.percentile(99.0).as_secs_f64() * 1000.0);
-    println!(" Latency mean:    {:.1} ms", hist.mean().as_secs_f64() * 1000.0);
+    println!(" Latency p50:      {:.1} ms", hist.percentile(50.0).as_secs_f64() * 1000.0);
+    println!(" Latency p95:      {:.1} ms", hist.percentile(95.0).as_secs_f64() * 1000.0);
+    println!(" Latency p99:      {:.1} ms", hist.percentile(99.0).as_secs_f64() * 1000.0);
+    println!(" Latency mean:     {:.1} ms", hist.mean().as_secs_f64() * 1000.0);
     println!("───────────────────────────────────────────────────────");
-    println!(
-        " Consistency:     {}",
+    println!(" Consistency:      {}",
         if all_same { "PASS — all stores converge to identical state" }
-        else { "FAIL — stores diverged! (possible consensus bug)" }
-    );
+        else { "FAIL — stores diverged! (possible consensus bug)" });
     println!("═══════════════════════════════════════════════════════");
     println!();
+
+    // Keep DB dirs alive until after the test (drop here to force cleanup).
+    drop(nodes);
 
     if !all_same || success_pct < 95.0 {
         std::process::exit(1);

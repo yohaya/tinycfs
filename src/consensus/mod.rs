@@ -214,6 +214,7 @@ impl Consensus {
         db: Option<RaftDb>,
         store: Arc<RwLock<FileStore>>,
         snapshot_every: u64,
+        persist_every: u64,
         max_file_size: u64,
         max_fs_size: u64,
     ) -> (Self, mpsc::Sender<Envelope>) {
@@ -241,6 +242,8 @@ impl Consensus {
                     db,
                     store,
                     snapshot_every,
+                    persist_every,
+                    last_persisted: 0,
                     max_file_size,
                     max_fs_size,
                     client_pending: HashMap::new(),
@@ -446,8 +449,13 @@ struct RaftEngine {
     pub_state: Arc<RwLock<PubState>>,
     db: Option<RaftDb>,
     store: Arc<RwLock<FileStore>>,
-    /// Snapshot interval from config (entries between snapshots).
+    /// Log compaction interval (entries between compact_log calls).
     snapshot_every: u64,
+    /// Snapshot persistence interval — write FileStore to SQLite every N entries.
+    /// Smaller = more I/O, better per-node durability.  Must be ≤ snapshot_every.
+    persist_every: u64,
+    /// last_applied index at which we last called persist_store.
+    last_persisted: LogIndex,
     /// Size limits from Config — re-applied to the store after every snapshot restore.
     max_file_size: u64,
     max_fs_size: u64,
@@ -1243,11 +1251,20 @@ impl RaftEngine {
     // ── Apply committed entries ───────────────────────────────────────────
 
     /// Advance last_applied up to commit_index, apply each entry to the store,
-    /// persist the FileStore to disk, then fire callbacks to waiting proposers.
+    /// then fire callbacks to waiting proposers.
     ///
-    /// Persistence happens BEFORE callbacks are fired so that a client only
-    /// receives "committed" after the data is durable on disk.  This guarantees
-    /// zero data loss: even a full cluster restart cannot lose a committed write.
+    /// **Durability model**: data committed by a Raft quorum is durable across
+    /// the cluster — at least a majority of nodes hold the entry in their
+    /// in-memory log before the leader reports "committed".  Per-node SQLite
+    /// persistence happens every `persist_every` entries via this function (or
+    /// at every `snapshot_every` log compaction, whichever comes first).
+    ///
+    /// Writing the full FileStore snapshot to SQLite on *every* committed batch
+    /// caused O(filesystem_size) I/O per write: serialise all files, write
+    /// ~N/4096 SQLite pages, `fsync`, then WAL-checkpoint (copy all pages back
+    /// from the WAL to the main DB file).  With thousands of files and a large
+    /// store this degraded throughput to single-digit KB/s and spiked CPU on
+    /// followers that apply the same entries.
     fn advance_applied(&mut self) {
         let start_applied = self.state.last_applied;
         let mut callbacks: Vec<(oneshot::Sender<FileOpResult>, FileOpResult)> = Vec::new();
@@ -1288,16 +1305,22 @@ impl RaftEngine {
             }
         }
 
-        // Persist the full filesystem state BEFORE signalling any client.
-        // The client only sees "committed" after the data is durable on disk.
         if self.state.last_applied > start_applied {
             self.proposals_committed += self.state.last_applied - start_applied;
-            let snap_term = self.state.log.term_at(self.state.last_applied)
-                .unwrap_or(self.state.log.snapshot_term);
-            self.persist_store(self.state.last_applied, snap_term);
+            // Persist the snapshot every persist_every entries.  Callbacks are
+            // fired *after* this block — if persist_every == 1 clients still
+            // wait for the SQLite write before getting a reply.
+            let due = self.last_persisted == 0
+                || self.state.last_applied - self.last_persisted >= self.persist_every;
+            if due {
+                let snap_term = self.state.log.term_at(self.state.last_applied)
+                    .unwrap_or(self.state.log.snapshot_term);
+                self.persist_store(self.state.last_applied, snap_term);
+                self.last_persisted = self.state.last_applied;
+            }
         }
 
-        // Fire deferred callbacks now that the write is durable.
+        // Fire callbacks (after optional persist so persist_every==1 is still safe).
         for (tx, result) in callbacks {
             let _ = tx.send(result);
         }
@@ -1343,12 +1366,22 @@ impl RaftEngine {
         }
     }
 
-    /// Compact the in-memory Raft log up to last_applied (memory management only —
-    /// the FileStore is already persisted by persist_store).
+    /// Compact the in-memory Raft log up to last_applied.
+    ///
+    /// Always persists the FileStore snapshot BEFORE discarding log entries.
+    /// After compaction those entries no longer exist in memory; if the node
+    /// crashed without a snapshot the only recovery path would be a full
+    /// InstallSnapshot from the leader.  Persisting first keeps the recovery
+    /// window bounded to at most `persist_every` entries even if the node
+    /// crashes immediately after log compaction.
     fn compact_log(&mut self) {
         let snap_index = self.state.last_applied;
         let snap_term = self.state.log.term_at(snap_index)
             .unwrap_or(self.state.log.snapshot_term);
+        // Always write a fresh snapshot at the compaction boundary regardless
+        // of when last_persisted was updated.
+        self.persist_store(snap_index, snap_term);
+        self.last_persisted = snap_index;
         self.state.log.compact_before(snap_index, snap_term);
         self.state.next_snapshot_at = snap_index + self.snapshot_every;
         debug!("Log compacted at index {} (term {})", snap_index, snap_term);
