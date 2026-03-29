@@ -114,7 +114,7 @@
 
   // ── File size limit ───────────────────────────────────────────────────────
 
-  // max_file_size_bytes  (optional — default: 1048576 = 1 MiB)
+  // max_file_size_bytes  (optional — default: 8388608 = 8 MiB)
   //
   // Maximum size of any single file.  Writes that would push a file beyond this
   // limit return EFBIG to the FUSE caller (same as a hard quota).  The limit
@@ -127,13 +127,29 @@
   //
   // Options (bytes):
   //    65536     —   64 KiB  (strict; matches simulation default)
-  //   1048576    —    1 MiB  (production default; matches pmxcfs limit)
-  //   5242880    —    5 MiB  (relaxed; only for trusted, fast LANs)
+  //   1048576    —    1 MiB  (conservative; matches pmxcfs limit)
+  //   8388608    —    8 MiB  (default)
   //  10485760    —   10 MiB  (maximum recommended; beyond this Raft heartbeat
   //                           timeouts may occur during large-entry replication)
   //
-  // Recommendation: leave at 1 MiB unless you store known-large files.
-  max_file_size_bytes: 1048576,
+  // Recommendation: leave at the default unless you need stricter limits.
+  max_file_size_bytes: 8388608,
+
+  // max_fs_size_bytes  (optional — default: 4294967296 = 4 GiB)
+  //
+  // Maximum total size of all file data held across the entire filesystem.
+  // Writes that would push the total beyond this limit return ENOSPC.
+  // The counter is maintained per-node in memory and is consistent across
+  // the cluster because all nodes apply the same committed log entries.
+  //
+  // Options (bytes):
+  //  1073741824  —  1 GiB
+  //  4294967296  —  4 GiB  (default)
+  // 17179869184  — 16 GiB  (large cluster with many small files)
+  //
+  // Set to a value larger than your available RAM to make the limit
+  // effectively unlimited (the OS will OOM before this triggers).
+  max_fs_size_bytes: 4294967296,
 
 
   // ── Log compaction / snapshotting ─────────────────────────────────────────
@@ -234,7 +250,8 @@
 //  local_node            string   —          YES        must match a nodes[].name
 //  data_dir              string   null       no         any writable directory path
 //  algorithm             string   "raft"     no         "raft" | "totem"
-//  max_file_size_bytes   integer  1048576    no         1 – 10485760 (bytes)
+//  max_file_size_bytes   integer  8388608    no         1 – 10485760 (bytes)
+//  max_fs_size_bytes     integer  4294967296 no         bytes; total across all files
 //  snapshot_every        integer  10000      no         100 – 1000000
 //  nodes[].name          string   —          YES        unique, stable identifier
 //  nodes[].ip            string   —          YES        reachable LAN IP address

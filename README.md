@@ -52,7 +52,7 @@ tinycfs combines a FUSE-based virtual filesystem with cluster membership and con
 | **Persistence** | Optional SQLite (`data_dir`) — stores Raft metadata + FileStore snapshot |
 | **Filesystem** | FUSE via the `fuser` crate; inode-based in-memory tree |
 | **Transport** | Direct TCP with 4-byte length-prefixed `bincode` frames; persistent connections |
-| **Small files** | All file data kept in memory; 1 MiB per-file limit (configurable) |
+| **Small files** | All file data kept in memory; 8 MiB per-file limit (configurable) |
 | **Config** | JSON5 (`tinycfs.conf`) — supports `//` and `/* */` comments |
 
 ### Consensus algorithm comparison
@@ -150,7 +150,8 @@ Files written on any node appear on all nodes within one Raft round-trip (~2 ms 
 | `local_node` | ✓ | — | Name of **this** node (must match one entry in `nodes`) |
 | `data_dir` | | `null` | Directory for SQLite persistence (`raft.db`). Omit for in-memory-only mode |
 | `algorithm` | | `"raft"` | Consensus algorithm: `"raft"` or `"totem"` |
-| `max_file_size_bytes` | | `1048576` | Per-file size limit in bytes (1 MiB default, max 10 MiB) |
+| `max_file_size_bytes` | | `8388608` | Per-file size limit in bytes (8 MiB default). Writes exceeding this return `EFBIG`. |
+| `max_fs_size_bytes` | | `4294967296` | Total filesystem size limit in bytes (4 GiB default). Writes that would exceed this return `ENOSPC`. |
 | `snapshot_every` | | `10000` | Raft log compaction interval in applied entries |
 | `nodes[].name` | ✓ | — | Unique node name (NodeId derived as SHA-256(name)[0..8]) |
 | `nodes[].ip` | ✓ | — | IP address this node listens on |
@@ -258,7 +259,7 @@ Consistency:  PASS - all stores converge to identical state
 
 ## Limitations (v0.1)
 
-- **Small files only**: All file data is held in RAM. Not suitable for large binary files (default 1 MiB limit per file).
+- **Small files only**: All file data is held in RAM. Not suitable for large binary files (default 8 MiB limit per file; configurable via `max_file_size_bytes`).
 - **Static membership**: The node list is read from config at startup. Online add/remove of nodes is not supported.
 - **No encryption**: Cluster traffic is plaintext TCP. Use a VPN or private network.
 - **Totem latency scales with N**: Totem write latency = (N/2) × RTT. Recommended for clusters of 3–7 nodes; use Raft for larger clusters or WAN deployments.

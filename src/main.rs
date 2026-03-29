@@ -260,6 +260,7 @@ async fn main() {
         store,
         config.local_node.clone(),
         config.max_file_size_bytes,
+        config.max_fs_size_bytes,
     );
 
     tokio::task::spawn_blocking(move || {

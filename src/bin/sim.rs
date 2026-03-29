@@ -181,6 +181,7 @@ async fn main() {
             data_dir: None,
             algorithm: algorithm.clone(),
             max_file_size_bytes: 64 * 1024, // 64 KiB limit in simulation
+            max_fs_size_bytes: 4 * 1024 * 1024 * 1024, // 4 GiB (effectively unlimited for sim)
             snapshot_every: 50_000,
             nodes: node_configs.clone(),
         };

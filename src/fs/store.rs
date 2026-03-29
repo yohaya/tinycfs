@@ -49,6 +49,11 @@ pub struct FileStore {
     next_ino: Ino,
     /// Distributed lock table: path → lock entry.
     locks: HashMap<String, LockEntry>,
+    /// Running total of all file data bytes across the filesystem.
+    /// Maintained incrementally; `#[serde(default)]` ensures old snapshots
+    /// without this field deserialize to 0 and self-correct on next write.
+    #[serde(default)]
+    total_data_bytes: u64,
 }
 
 impl FileStore {
@@ -67,7 +72,7 @@ impl FileStore {
             ctime: SystemTime::now(),
         };
         inodes.insert(ROOT_INO, Inode::Dir(DirInode { meta: root_meta, parent_ino: ROOT_INO, entries: HashMap::new() }));
-        FileStore { inodes, next_ino: 2, locks: HashMap::new() }
+        FileStore { inodes, next_ino: 2, locks: HashMap::new(), total_data_bytes: 0 }
     }
 
     fn alloc_ino(&mut self) -> Ino {
@@ -88,6 +93,11 @@ impl FileStore {
         } else {
             None
         }
+    }
+
+    /// Total bytes of file data currently held across all files.
+    pub fn total_data_bytes(&self) -> u64 {
+        self.total_data_bytes
     }
 
     pub fn readdir(&self, ino: Ino) -> Result<Vec<(String, Ino, InoKind)>> {
@@ -300,12 +310,16 @@ impl FileStore {
         let ino = self.resolve_path(path)?;
         match self.inodes.get_mut(&ino) {
             Some(Inode::File(f)) => {
+                let old_size = f.data.len() as u64;
                 let end = (offset as usize) + data.len();
                 if end > f.data.len() {
                     f.data.resize(end, 0);
                 }
                 f.data[offset as usize..end].copy_from_slice(data);
                 f.meta.mtime = SystemTime::now();
+                let new_size = f.data.len() as u64;
+                self.total_data_bytes =
+                    self.total_data_bytes.saturating_add(new_size).saturating_sub(old_size);
                 Ok(())
             }
             Some(_) => Err(TinyCfsError::IsDirectory),
@@ -317,8 +331,11 @@ impl FileStore {
         let ino = self.resolve_path(path)?;
         match self.inodes.get_mut(&ino) {
             Some(Inode::File(f)) => {
+                let old_size = f.data.len() as u64;
                 f.data.resize(size as usize, 0);
                 f.meta.mtime = SystemTime::now();
+                self.total_data_bytes =
+                    self.total_data_bytes.saturating_add(size).saturating_sub(old_size);
                 Ok(())
             }
             Some(_) => Err(TinyCfsError::IsDirectory),
@@ -333,6 +350,9 @@ impl FileStore {
             .ok_or_else(|| TinyCfsError::NotFound(name.to_string()))?;
         if matches!(self.inodes.get(&child_ino), Some(Inode::Dir(_))) {
             return Err(TinyCfsError::IsDirectory);
+        }
+        if let Some(Inode::File(f)) = self.inodes.get(&child_ino) {
+            self.total_data_bytes = self.total_data_bytes.saturating_sub(f.data.len() as u64);
         }
         if let Some(Inode::Dir(dir)) = self.inodes.get_mut(&parent_ino) {
             dir.entries.remove(name);
@@ -402,8 +422,11 @@ impl FileStore {
         let now = SystemTime::now();
         if let Some(size) = size {
             if let Some(Inode::File(f)) = self.inodes.get_mut(&ino) {
+                let old_size = f.data.len() as u64;
                 f.data.resize(size as usize, 0);
                 f.meta.mtime = now;
+                self.total_data_bytes =
+                    self.total_data_bytes.saturating_add(size).saturating_sub(old_size);
             }
         }
         if let Some(inode) = self.inodes.get_mut(&ino) {

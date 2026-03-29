@@ -4,30 +4,60 @@
 
 After modifying **any** Rust source file (`src/**/*.rs`, `Cargo.toml`, `Cargo.lock`):
 
-### 1 — Trigger the GitHub CI build
+### 1 — Commit and push to main
 
-Commit the changes and push to `main`.  The push automatically triggers
-`.github/workflows/build.yml`, which compiles release binaries inside
-Docker containers for:
+```bash
+git add <changed files>
+git commit -m "..."
+git push origin main
+```
 
-| Target | Distro | glibc |
+The push automatically triggers `.github/workflows/build.yml`.
+
+### 2 — Wait for the CI workflow to complete
+
+```bash
+# Watch the run in real time (blocks until done)
+gh run watch
+```
+
+Or check status:
+
+```bash
+gh run list --limit 5
+gh run view           # view most recent run
+```
+
+The workflow compiles release binaries inside Docker containers for:
+
+| Binary in `bin/` | Distro | glibc |
 |---|---|---|
-| `debian8` | Debian 8 (jessie) | 2.19 |
-| `debian9` | Debian 9 (stretch) | 2.24 |
-| `ubuntu22` | Ubuntu 22.04 LTS | 2.35 |
-| `ubuntu24` | Ubuntu 24.04 LTS | 2.38 |
-| `musl-static` | Alpine/any Linux | none (static) |
+| `tinycfs-ubuntu22-x86_64` | Ubuntu 22.04 LTS | 2.35 |
+| `tinycfs-ubuntu24-x86_64` | Ubuntu 24.04 LTS | 2.38 |
+| `tinycfs-linux-x86_64` | musl-static (Alpine/any) | none |
 
-The workflow also compiles a **static musl binary** (`x86_64-unknown-linux-musl`)
-and commits it to `bin/tinycfs-linux-x86_64` in the repository so it is always
-available for direct download without a release page.
+### 3 — Verify bin/ was updated
 
-To trigger manually without pushing:
+After the `Publish bin/` job completes, pull the updated binaries:
+
+```bash
+git pull
+ls -lh bin/
+```
+
+Expected output:
+```
+bin/tinycfs-linux-x86_64       # static musl — universal
+bin/tinycfs-ubuntu22-x86_64    # glibc 2.35
+bin/tinycfs-ubuntu24-x86_64    # glibc 2.38
+```
+
+To trigger the workflow manually without pushing:
 ```bash
 gh workflow run build.yml
 ```
 
-### 2 — Run the local cluster pressure-test simulation
+### 4 — Run the local cluster pressure-test simulation
 
 ```bash
 cargo run --bin sim -- \
@@ -66,11 +96,13 @@ the code is considered ready for review.
 |---|---|
 | `src/cluster/` | TCP cluster transport, peer management, delay injection |
 | `src/consensus/` | Raft actor engine — batching, parallel per-peer replication |
+| `src/totem/` | Totem SRTP consensus engine — token-ring total-order multicast |
 | `src/fs/` | FUSE filesystem + in-memory inode state machine |
 | `src/bin/sim.rs` | Cluster pressure-test simulation binary |
 | `.github/workflows/build.yml` | Cross-distro release build CI |
-| `scripts/post-change.sh` | Hook script: push + simulate after code changes |
-| `tinycfs.conf.example` | Example JSON configuration |
+| `bin/` | Pre-built binaries committed by CI after every push to main |
+| `install.sh` | Install script: copies binary + config, installs systemd unit |
+| `tinycfs.conf.example` | Fully annotated JSON5 configuration reference |
 
 ## Build requirements
 
@@ -93,14 +125,18 @@ cargo build --release
 
 ## Configuration format (`tinycfs.conf`)
 
-```json
+```json5
 {
-  "cluster_name": "mycluster",
-  "local_node": "node1",
-  "nodes": [
-    { "name": "node1", "ip": "192.168.1.10", "port": 7788 },
-    { "name": "node2", "ip": "192.168.1.11", "port": 7788 },
-    { "name": "node3", "ip": "192.168.1.12", "port": 7788 }
+  cluster_name: "mycluster",
+  local_node: "node1",
+  data_dir: "/var/lib/tinycfs",
+  algorithm: "raft",             // "raft" or "totem"
+  max_file_size_bytes: 8388608,  // 8 MiB per file
+  max_fs_size_bytes: 4294967296, // 4 GiB total
+  nodes: [
+    { name: "node1", ip: "192.168.1.10", port: 7788 },
+    { name: "node2", ip: "192.168.1.11", port: 7788 },
+    { name: "node3", ip: "192.168.1.12", port: 7788 }
   ]
 }
 ```

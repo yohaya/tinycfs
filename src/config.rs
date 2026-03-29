@@ -42,8 +42,13 @@ impl NodeConfig {
 }
 
 fn default_max_file_size() -> u64 {
-    // 1 MiB — matches pmxcfs default
-    1 * 1024 * 1024
+    // 8 MiB default
+    8 * 1024 * 1024
+}
+
+fn default_max_fs_size() -> u64 {
+    // 4 GiB default
+    4 * 1024 * 1024 * 1024
 }
 
 fn default_snapshot_every() -> usize {
@@ -83,6 +88,10 @@ pub struct Config {
     /// Maximum file size in bytes. Writes exceeding this return EFBIG.
     #[serde(default = "default_max_file_size")]
     pub max_file_size_bytes: u64,
+    /// Maximum total filesystem size in bytes (sum of all file data). Writes
+    /// that would exceed this return ENOSPC. Default: 4 GiB.
+    #[serde(default = "default_max_fs_size")]
+    pub max_fs_size_bytes: u64,
     /// Take a FileStore snapshot (and compact the Raft log) every N applied entries.
     #[serde(default = "default_snapshot_every")]
     pub snapshot_every: usize,

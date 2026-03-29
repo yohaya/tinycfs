@@ -30,6 +30,8 @@ pub struct TinyCfs {
     node_name: String,
     /// Maximum file size in bytes (configurable via Config).
     max_file_size: u64,
+    /// Maximum total filesystem size in bytes across all files.
+    max_fs_size: u64,
 }
 
 impl TinyCfs {
@@ -39,8 +41,9 @@ impl TinyCfs {
         store: Arc<RwLock<FileStore>>,
         node_name: String,
         max_file_size: u64,
+        max_fs_size: u64,
     ) -> Self {
-        TinyCfs { handle, consensus, store, node_name, max_file_size }
+        TinyCfs { handle, consensus, store, node_name, max_file_size, max_fs_size }
     }
 
     fn path_for(&self, parent: u64, name: &OsStr) -> Option<String> {
@@ -207,7 +210,23 @@ impl Filesystem for TinyCfs {
             return;
         }
 
-        let path = self.ino_path(ino);
+        // Enforce total filesystem size limit before proposing.
+        let (path, would_exceed) = {
+            let store = self.store.read();
+            let path = self.ino_to_path(&store, ino);
+            let current_file_size = match store.get(ino) {
+                Some(crate::fs::inode::Inode::File(f)) => f.data.len() as u64,
+                _ => 0,
+            };
+            let growth = end.saturating_sub(current_file_size);
+            let would_exceed =
+                store.total_data_bytes().saturating_add(growth) > self.max_fs_size;
+            (path, would_exceed)
+        };
+        if would_exceed {
+            reply.error(libc::ENOSPC);
+            return;
+        }
         let op = FileOp::Write { path, offset: offset as u64, data: data.to_vec() };
         let consensus = self.consensus.clone();
         let data_len = data.len();
