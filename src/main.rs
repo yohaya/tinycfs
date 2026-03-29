@@ -29,9 +29,10 @@ use tinycfs::syslog_layer::SyslogLayer;
 )]
 struct Args {
     /// Directory to mount the shared filesystem on.
-    mountpoint: PathBuf,
+    /// If omitted, the `mountpoint` field in tinycfs.conf is used.
+    mountpoint: Option<PathBuf>,
 
-    /// Path to the JSON configuration file.
+    /// Path to the JSON5 configuration file.
     #[arg(
         short,
         long,
@@ -48,21 +49,33 @@ struct Args {
     #[arg(long)]
     allow_root: bool,
 
-    // ── Execution control ─────────────────────────────────────────────────
+    // ── Execution control — if neither flag is passed, config value is used ──
 
-    #[arg(long, default_value_t = true)]
+    /// Disallow execution of binaries (overrides config).
+    #[arg(long, overrides_with = "exec")]
     noexec: bool,
 
-    #[arg(long, conflicts_with = "noexec", default_value_t = false)]
+    /// Allow execution of binaries (overrides config and --noexec).
+    #[arg(long, overrides_with = "noexec")]
     exec: bool,
 
-    // ── Performance / atime ───────────────────────────────────────────────
+    // ── atime — if neither flag is passed, config value is used ─────────────
 
-    #[arg(long, default_value_t = true)]
+    /// Disable access-time updates (overrides config).
+    #[arg(long, overrides_with = "atime")]
     noatime: bool,
 
-    #[arg(long, default_value_t = true)]
+    /// Enable access-time updates (overrides config and --noatime).
+    #[arg(long, overrides_with = "noatime")]
+    atime: bool,
+
+    /// Disable directory access-time updates (overrides config).
+    #[arg(long, overrides_with = "diratime")]
     nodiratime: bool,
+
+    /// Enable directory access-time updates (overrides config and --nodiratime).
+    #[arg(long, overrides_with = "nodiratime")]
+    diratime: bool,
 
     #[arg(long, default_value_t = false)]
     relatime: bool,
@@ -72,13 +85,23 @@ struct Args {
     #[arg(long, short = 'r')]
     read_only: bool,
 
-    // ── SUID / device files ───────────────────────────────────────────────
+    // ── SUID / device files — if neither flag is passed, config value is used ─
 
-    #[arg(long, default_value_t = true)]
+    /// Disallow setuid execution (overrides config).
+    #[arg(long, overrides_with = "suid")]
     nosuid: bool,
 
-    #[arg(long, default_value_t = true)]
+    /// Allow setuid execution (overrides config and --nosuid).
+    #[arg(long, overrides_with = "nosuid")]
+    suid: bool,
+
+    /// Disallow device file interpretation (overrides config).
+    #[arg(long, overrides_with = "dev")]
     nodev: bool,
+
+    /// Allow device file interpretation (overrides config and --nodev).
+    #[arg(long, overrides_with = "nodev")]
+    dev: bool,
 
     // ── Kernel caching ────────────────────────────────────────────────────
 
@@ -111,7 +134,6 @@ async fn main() {
         .init();
 
     let args = Args::parse();
-    let exec_enabled = args.exec || !args.noexec;
 
     // ── Configuration ─────────────────────────────────────────────────────
     let config = match Config::load(&args.config) {
@@ -135,11 +157,11 @@ async fn main() {
         .map(|n| format!("{}={}:{}", n.name, n.ip, n.port))
         .collect::<Vec<_>>()
         .join(", ");
+    // Note: mountpoint is resolved after config load, so we log it later.
     SyslogLayer::startup(&format!(
-        "starting node='{}' cluster='{}' mountpoint='{}' peers=[{}]",
+        "starting node='{}' cluster='{}' peers=[{}]",
         config.local_node,
         config.cluster_name,
-        args.mountpoint.display(),
         peer_list,
     ));
 
@@ -193,12 +215,31 @@ async fn main() {
         }
     });
 
-    // ── FUSE mount options ────────────────────────────────────────────────
-    let mountpoint = args.mountpoint.clone();
+    // ── Resolve mountpoint (CLI > config) ────────────────────────────────
+    let mountpoint: PathBuf = match args.mountpoint.clone().or_else(|| {
+        config.mountpoint.as_ref().map(PathBuf::from)
+    }) {
+        Some(p) => p,
+        None => {
+            error!(
+                "No mountpoint specified. Pass it on the command line or set \
+                 mountpoint in tinycfs.conf."
+            );
+            std::process::exit(1);
+        }
+    };
     if !mountpoint.exists() {
         error!("Mount point {:?} does not exist", mountpoint);
         std::process::exit(1);
     }
+
+    // ── Resolve mount flags (CLI explicit > config defaults) ─────────────
+    // Flag pairs: if both are false the user didn't pass either → use config.
+    let noexec    = if args.noexec    { true  } else if args.exec      { false } else { config.noexec };
+    let noatime   = if args.noatime   { true  } else if args.atime     { false } else { config.noatime };
+    let nodiratime= if args.nodiratime{ true  } else if args.diratime  { false } else { config.nodiratime };
+    let nosuid    = if args.nosuid    { true  } else if args.suid      { false } else { config.nosuid };
+    let nodev     = if args.nodev     { true  } else if args.dev       { false } else { config.nodev };
 
     let mut fuse_opts: Vec<fuser::MountOption> = vec![
         fuser::MountOption::FSName("tinycfs".to_string()),
@@ -219,21 +260,21 @@ async fn main() {
         fuse_opts.push(fuser::MountOption::RO);
         info!("Mounted read-only (--read-only)");
     }
-    if exec_enabled {
-        fuse_opts.push(fuser::MountOption::Exec);
-    } else {
+    if noexec {
         fuse_opts.push(fuser::MountOption::NoExec);
+    } else {
+        fuse_opts.push(fuser::MountOption::Exec);
     }
-    if args.nosuid {
+    if nosuid {
         fuse_opts.push(fuser::MountOption::NoSuid);
     }
-    if args.nodev {
+    if nodev {
         fuse_opts.push(fuser::MountOption::NoDev);
     }
-    if args.noatime {
+    if noatime {
         fuse_opts.push(fuser::MountOption::NoAtime);
     }
-    if args.relatime && !args.noatime {
+    if args.relatime && !noatime {
         fuse_opts.push(fuser::MountOption::CUSTOM("relatime".to_string()));
     }
     if args.direct_io {
@@ -244,11 +285,11 @@ async fn main() {
         "Mounting at {:?} [noexec={}, noatime={}, nodiratime={}, nosuid={}, \
          nodev={}, ro={}, direct_io={}]",
         mountpoint,
-        !exec_enabled,
-        args.noatime,
-        args.nodiratime,
-        args.nosuid,
-        args.nodev,
+        noexec,
+        noatime,
+        nodiratime,
+        nosuid,
+        nodev,
         args.read_only,
         args.direct_io,
     );

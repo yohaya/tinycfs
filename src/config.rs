@@ -56,6 +56,8 @@ fn default_snapshot_every() -> usize {
     10_000
 }
 
+fn default_true() -> bool { true }
+
 /// Top-level tinycfs.conf configuration.
 ///
 /// Example:
@@ -95,6 +97,25 @@ pub struct Config {
     /// Take a FileStore snapshot (and compact the Raft log) every N applied entries.
     #[serde(default = "default_snapshot_every")]
     pub snapshot_every: usize,
+    /// Default FUSE mount point. Used when no mountpoint is passed on the command line.
+    #[serde(default)]
+    pub mountpoint: Option<String>,
+    // ── Default FUSE mount options ─────────────────────────────────────────
+    /// Disallow execution of files on the mount. Default: true.
+    #[serde(default = "default_true")]
+    pub noexec: bool,
+    /// Skip updating access times on reads. Default: true (improves performance).
+    #[serde(default = "default_true")]
+    pub noatime: bool,
+    /// Skip updating directory access times on reads. Default: true.
+    #[serde(default = "default_true")]
+    pub nodiratime: bool,
+    /// Disallow setuid/setgid execution. Default: true (security hardening).
+    #[serde(default = "default_true")]
+    pub nosuid: bool,
+    /// Disallow interpretation of block/character device files. Default: true.
+    #[serde(default = "default_true")]
+    pub nodev: bool,
     /// List of all nodes in the cluster (including this one).
     pub nodes: Vec<NodeConfig>,
 }

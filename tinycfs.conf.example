@@ -183,6 +183,73 @@
   snapshot_every: 10000,
 
 
+  // ── Mount point ───────────────────────────────────────────────────────────
+
+  // mountpoint  (optional — may also be passed as the first CLI argument)
+  //
+  // The directory where tinycfs exposes the shared filesystem via FUSE.
+  //
+  // If this field is set, you can start tinycfs without specifying a path on
+  // the command line:
+  //
+  //   tinycfs --config /etc/tinycfs/tinycfs.conf
+  //
+  // A CLI argument always takes precedence over this field.
+  //
+  // The directory must already exist before tinycfs starts.  The install script
+  // creates /mnt/tinycfs automatically.
+  //
+  // Options:
+  //   "/mnt/tinycfs"     — conventional location for cluster-wide mounts
+  //   "/srv/cluster"     — alternative for service-oriented layouts
+  //   "/pve/nodes/local" — Proxmox-compatible path
+  mountpoint: "/mnt/tinycfs",
+
+
+  // ── Default FUSE mount options ────────────────────────────────────────────
+  //
+  // These control how the kernel treats the mounted filesystem.  CLI flags
+  // (--noexec, --exec, --noatime, etc.) take precedence over these values.
+  //
+  // All of these default to true as appropriate safe defaults for a shared
+  // configuration filesystem.
+
+  // noexec  (optional — default: true)
+  //
+  // Disallow execution of programs stored on this filesystem.
+  // Recommended: true — tinycfs stores configuration files, not executables.
+  //              Setting false is a security risk: any node can place a binary
+  //              that every cluster member might run.
+  noexec: true,
+
+  // noatime  (optional — default: true)
+  //
+  // Skip updating the access-time (atime) inode field on reads.
+  // Recommended: true — eliminates write amplification from read-heavy workloads.
+  //              Each atime update would generate a Raft log entry replicated
+  //              to every node.  With atime disabled, reads are zero-overhead.
+  noatime: true,
+
+  // nodiratime  (optional — default: true)
+  //
+  // Same as noatime but specifically for directory access times.
+  // Recommended: true — same reasoning as noatime.
+  nodiratime: true,
+
+  // nosuid  (optional — default: true)
+  //
+  // Disallow setuid and setgid bits from taking effect on this filesystem.
+  // Recommended: true — prevents privilege escalation via SUID binaries
+  //              inadvertently written to the shared filesystem.
+  nosuid: true,
+
+  // nodev  (optional — default: true)
+  //
+  // Disallow interpretation of block and character device files.
+  // Recommended: true — tinycfs holds configuration data, not device nodes.
+  nodev: true,
+
+
   // ── Cluster membership ────────────────────────────────────────────────────
 
   // nodes  (required — at least 3 entries)
@@ -253,6 +320,12 @@
 //  max_file_size_bytes   integer  8388608    no         1 – 10485760 (bytes)
 //  max_fs_size_bytes     integer  4294967296 no         bytes; total across all files
 //  snapshot_every        integer  10000      no         100 – 1000000
+//  mountpoint            string   null       no         FUSE mount directory path
+//  noexec                bool     true       no         disallow execution on mount
+//  noatime               bool     true       no         skip atime updates on reads
+//  nodiratime            bool     true       no         skip dir atime updates
+//  nosuid                bool     true       no         disallow setuid/setgid
+//  nodev                 bool     true       no         disallow device files
 //  nodes[].name          string   —          YES        unique, stable identifier
 //  nodes[].ip            string   —          YES        reachable LAN IP address
 //  nodes[].port          integer  7788       no         1024 – 65535

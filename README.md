@@ -152,6 +152,12 @@ Files written on any node appear on all nodes within one Raft round-trip (~2 ms 
 | `algorithm` | | `"raft"` | Consensus algorithm: `"raft"` or `"totem"` |
 | `max_file_size_bytes` | | `8388608` | Per-file size limit in bytes (8 MiB default). Writes exceeding this return `EFBIG`. |
 | `max_fs_size_bytes` | | `4294967296` | Total filesystem size limit in bytes (4 GiB default). Writes that would exceed this return `ENOSPC`. |
+| `mountpoint` | | `null` | Default FUSE mount path. Used when no path is passed on the CLI. |
+| `noexec` | | `true` | Disallow execution of files on the mount. |
+| `noatime` | | `true` | Skip access-time updates on reads (reduces write amplification). |
+| `nodiratime` | | `true` | Skip directory access-time updates on reads. |
+| `nosuid` | | `true` | Disallow setuid/setgid execution. |
+| `nodev` | | `true` | Disallow device file interpretation. |
 | `snapshot_every` | | `10000` | Raft log compaction interval in applied entries |
 | `nodes[].name` | ✓ | — | Unique node name (NodeId derived as SHA-256(name)[0..8]) |
 | `nodes[].ip` | ✓ | — | IP address this node listens on |
