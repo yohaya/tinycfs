@@ -40,16 +40,15 @@ use crate::persistence::RaftDb;
 
 // ─── Tunables ─────────────────────────────────────────────────────────────────
 
-const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(5);
-/// Election timeouts are set wide enough that no follower fires before the
-/// newly elected leader's first heartbeat arrives.  Worst-case path:
-///   ELECTION_TIMEOUT_MAX (winning node waits this long)
-///   + vote RTT (~20 ms for 10 ms one-way delay)
-///   + heartbeat one-way delay (~10 ms)
-///   + forwarding-task scheduling jitter (~10 ms)
-/// ≈ 340 ms.  Min = 2× that to be safe.
-const ELECTION_TIMEOUT_MIN: Duration = Duration::from_millis(700);
-const ELECTION_TIMEOUT_MAX: Duration = Duration::from_millis(1400);
+/// How often the leader sends heartbeats / replication RPCs when idle.
+/// 100 ms matches the etcd/Consul production default and gives 10× headroom
+/// against the election timeout floor.  Writes still replicate immediately
+/// (not on the heartbeat timer) so this only affects idle keepalive cost.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
+/// Election timeouts must be >> HEARTBEAT_INTERVAL so followers never
+/// fire prematurely.  10–20× ratio is the standard production range.
+const ELECTION_TIMEOUT_MIN: Duration = Duration::from_millis(1000);
+const ELECTION_TIMEOUT_MAX: Duration = Duration::from_millis(2000);
 /// Max entries per AppendEntries RPC — larger batches amortise per-RPC cost at
 /// high node counts.
 const MAX_ENTRIES_PER_RPC: usize = 1024;
@@ -397,9 +396,14 @@ impl RaftEngine {
                 biased;
                 Some(env) = msg_rx.recv() => {
                     self.handle_message(env.from, env.msg);
-                    // ClientRequest messages append log entries without replicating
-                    // (to allow batching). Trigger replication now so forwarded
-                    // requests are not delayed until the next heartbeat.
+                    // Drain any additional messages that arrived while we were
+                    // processing this one.  Multiple ClientRequest messages from
+                    // followers accumulate log entries in one pass so
+                    // replicate_if_new_entries() sends them in a single batch
+                    // rather than one AppendEntries RPC per forwarded request.
+                    while let Ok(env) = msg_rx.try_recv() {
+                        self.handle_message(env.from, env.msg);
+                    }
                     self.replicate_if_new_entries();
                 }
                 _ = time::sleep_until(next_timeout) => {

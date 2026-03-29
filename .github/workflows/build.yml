@@ -54,6 +54,7 @@ jobs:
             --env CARGO_TERM_COLOR=always \
             --env TINYCFS_BUILD_NUMBER=${{ github.run_number }} \
             --env TINYCFS_GIT_SHA=${{ github.sha }} \
+            --env TINYCFS_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             "${{ matrix.image }}" \
             bash -eux -c '
               export DEBIAN_FRONTEND=noninteractive
@@ -110,6 +111,7 @@ jobs:
           TINYCFS_BUILD_NUMBER: ${{ github.run_number }}
           TINYCFS_GIT_SHA: ${{ github.sha }}
         run: |
+          export TINYCFS_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           cargo build --release --locked --target x86_64-unknown-linux-musl 2>&1
           # Verify it is truly statically linked
           file target/x86_64-unknown-linux-musl/release/tinycfs

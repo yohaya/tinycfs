@@ -431,22 +431,18 @@ async fn writer_task(
     let mut last_deliver = Instant::now();
 
     while let Some((sent_at, msg)) = rx.recv().await {
-        // Compute when this message should be delivered.
-        let deliver_at = if let Some((min, max)) = delay {
+        // Only sleep when simulated network delay is enabled.  In production
+        // (delay == None) skipping the sleep avoids a spurious 1-ms timer
+        // wakeup per message (sleep_until(Instant::now()) is never a true
+        // no-op — Tokio schedules it for the next timer wheel tick).
+        if let Some((min, max)) = delay {
             let ms = rand::thread_rng()
                 .gen_range(min.as_millis() as u64..=max.as_millis() as u64);
-            // Use sent_at so the delay is relative to when the message was
-            // actually sent, not when this task happened to wake up.
             let intended = sent_at + Duration::from_millis(ms);
-            // Can't deliver before the previous message is written.
-            intended.max(last_deliver)
-        } else {
-            Instant::now()
-        };
-        last_deliver = deliver_at;
-
-        // sleep_until is a no-op if deliver_at has already passed.
-        time::sleep_until(deliver_at).await;
+            let deliver_at = intended.max(last_deliver);
+            last_deliver = deliver_at;
+            time::sleep_until(deliver_at).await;
+        }
 
         let payload = match bincode::serialize(&msg) {
             Ok(p) => p,

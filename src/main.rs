@@ -146,8 +146,9 @@ async fn main() {
         .join(", ");
     // Note: mountpoint is resolved after config load, so we log it later.
     SyslogLayer::startup(&format!(
-        "starting v{} node='{}' cluster='{}' peers=[{}]",
+        "starting TinyCFS v{} ({}) node='{}' cluster='{}' peers=[{}]",
         env!("TINYCFS_VERSION"),
+        env!("TINYCFS_BUILD_TIME"),
         config.local_node,
         config.cluster_name,
         peer_list,
