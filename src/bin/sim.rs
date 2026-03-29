@@ -181,7 +181,7 @@ async fn main() {
             data_dir: None,
             algorithm: algorithm.clone(),
             max_file_size_bytes: 64 * 1024,
-            max_fs_size_bytes: 4 * 1024 * 1024 * 1024,
+            max_fs_size_bytes: 1 * 1024 * 1024 * 1024,
             snapshot_every: 50_000,
             mountpoint: None,
             noexec: true,

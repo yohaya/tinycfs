@@ -32,6 +32,8 @@ The workflow compiles release binaries inside Docker containers for:
 
 | Binary in `bin/` | Distro | glibc |
 |---|---|---|
+| `tinycfs-debian11-x86_64` | Debian 11 (bullseye) | 2.31 |
+| `tinycfs-debian12-x86_64` | Debian 12 (bookworm) | 2.36 |
 | `tinycfs-ubuntu22-x86_64` | Ubuntu 22.04 LTS | 2.35 |
 | `tinycfs-ubuntu24-x86_64` | Ubuntu 24.04 LTS | 2.38 |
 | `tinycfs-linux-x86_64` | musl-static (Alpine/any) | none |
@@ -132,7 +134,7 @@ cargo build --release
   data_dir: "/var/lib/tinycfs",
   algorithm: "raft",             // "raft" or "totem"
   max_file_size_bytes: 8388608,  // 8 MiB per file
-  max_fs_size_bytes: 4294967296, // 4 GiB total
+  max_fs_size_bytes: 1073741824, // 1 GiB total
   nodes: [
     { name: "node1", ip: "192.168.1.10", port: 7788 },
     { name: "node2", ip: "192.168.1.11", port: 7788 },

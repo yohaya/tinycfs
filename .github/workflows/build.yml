@@ -25,6 +25,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ── Debian 12 (bookworm) — current stable, glibc 2.36 ──────────────
+          - name: debian12
+            image: debian:12
+
+          # ── Debian 11 (bullseye) — previous stable, glibc 2.31 ─────────────
+          - name: debian11
+            image: debian:11
+
           # ── Ubuntu 22.04 LTS (jammy) — glibc 2.35 ──────────────────────────
           - name: ubuntu22
             image: ubuntu:22.04

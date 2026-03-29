@@ -47,8 +47,8 @@ fn default_max_file_size() -> u64 {
 }
 
 fn default_max_fs_size() -> u64 {
-    // 4 GiB default
-    4 * 1024 * 1024 * 1024
+    // 1 GiB default
+    1 * 1024 * 1024 * 1024
 }
 
 fn default_snapshot_every() -> usize {
