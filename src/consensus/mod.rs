@@ -39,16 +39,6 @@ use crate::fs::store::FileStore;
 use crate::persistence::RaftDb;
 
 // ─── Tunables ─────────────────────────────────────────────────────────────────
-
-/// How often the leader sends heartbeats / replication RPCs when idle.
-/// 100 ms matches the etcd/Consul production default and gives 10× headroom
-/// against the election timeout floor.  Writes still replicate immediately
-/// (not on the heartbeat timer) so this only affects idle keepalive cost.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
-/// Election timeouts must be >> HEARTBEAT_INTERVAL so followers never
-/// fire prematurely.  10–20× ratio is the standard production range.
-const ELECTION_TIMEOUT_MIN: Duration = Duration::from_millis(1000);
-const ELECTION_TIMEOUT_MAX: Duration = Duration::from_millis(2000);
 /// Max entries per AppendEntries RPC — larger batches amortise per-RPC cost at
 /// high node counts.
 const MAX_ENTRIES_PER_RPC: usize = 1024;
@@ -102,20 +92,28 @@ struct RaftState {
     next_req_id: u64,
     /// Next snapshot threshold.
     next_snapshot_at: LogIndex,
+    /// Configurable election timeouts (carried here so become_follower can use them).
+    election_timeout_min_ms: u64,
+    election_timeout_max_ms: u64,
 }
 
 impl RaftState {
-    fn new(snapshot_every: LogIndex) -> Self {
+    fn new(snapshot_every: LogIndex, election_timeout_min_ms: u64, election_timeout_max_ms: u64) -> Self {
         RaftState {
             current_term: 0,
             voted_for: None,
             log: Log::new(),
             commit_index: 0,
             last_applied: 0,
-            role: Role::Follower { leader: None, election_deadline: random_deadline() },
+            role: Role::Follower {
+                leader: None,
+                election_deadline: random_deadline(election_timeout_min_ms, election_timeout_max_ms),
+            },
             pending: HashMap::new(),
             next_req_id: 1,
             next_snapshot_at: snapshot_every,
+            election_timeout_min_ms,
+            election_timeout_max_ms,
         }
     }
 
@@ -135,15 +133,16 @@ impl RaftState {
         self.voted_for = None;
         // Drop any pending leader callbacks so propose() retries quickly.
         self.pending.clear();
-        self.role = Role::Follower { leader, election_deadline: random_deadline() };
+        self.role = Role::Follower {
+            leader,
+            election_deadline: random_deadline(self.election_timeout_min_ms, self.election_timeout_max_ms),
+        };
     }
 }
 
-fn random_deadline() -> Instant {
+fn random_deadline(min_ms: u64, max_ms: u64) -> Instant {
     use rand::Rng;
-    let ms = rand::thread_rng().gen_range(
-        ELECTION_TIMEOUT_MIN.as_millis() as u64..=ELECTION_TIMEOUT_MAX.as_millis() as u64,
-    );
+    let ms = rand::thread_rng().gen_range(min_ms..=max_ms);
     Instant::now() + Duration::from_millis(ms)
 }
 
@@ -217,6 +216,9 @@ impl Consensus {
         persist_every: u64,
         max_file_size: u64,
         max_fs_size: u64,
+        heartbeat_interval_ms: u64,
+        election_timeout_min_ms: u64,
+        election_timeout_max_ms: u64,
     ) -> (Self, mpsc::Sender<Envelope>) {
         match algorithm {
             ConsensusAlgorithm::Raft => {
@@ -225,9 +227,9 @@ impl Consensus {
                 let pub_state = Arc::new(RwLock::new(PubState::default()));
 
                 let state = if let Some(ref db) = db {
-                    load_state_from_db(db, &store, snapshot_every)
+                    load_state_from_db(db, &store, snapshot_every, election_timeout_min_ms, election_timeout_max_ms)
                 } else {
-                    RaftState::new(snapshot_every)
+                    RaftState::new(snapshot_every, election_timeout_min_ms, election_timeout_max_ms)
                 };
 
                 // Re-apply size limits after potential snapshot restore.
@@ -246,6 +248,7 @@ impl Consensus {
                     last_persisted: 0,
                     max_file_size,
                     max_fs_size,
+                    heartbeat_interval: Duration::from_millis(heartbeat_interval_ms),
                     client_pending: HashMap::new(),
                     deferred_responses: HashMap::new(),
                     heartbeats_sent: 0,
@@ -367,7 +370,13 @@ impl Consensus {
 
 // ─── State loader ─────────────────────────────────────────────────────────────
 
-fn load_state_from_db(db: &RaftDb, store: &Arc<RwLock<FileStore>>, snapshot_every: u64) -> RaftState {
+fn load_state_from_db(
+    db: &RaftDb,
+    store: &Arc<RwLock<FileStore>>,
+    snapshot_every: u64,
+    election_timeout_min_ms: u64,
+    election_timeout_max_ms: u64,
+) -> RaftState {
     // Raft safety depends on reading the correct term and voted_for on restart.
     // Treating a DB error as "no prior state" (term=0, voted_for=None) would
     // reset the node to a blank slate and allow it to vote in any term,
@@ -440,10 +449,15 @@ fn load_state_from_db(db: &RaftDb, store: &Arc<RwLock<FileStore>>, snapshot_ever
         log,
         commit_index: snapshot_index,
         last_applied: snapshot_index,
-        role: Role::Follower { leader: None, election_deadline: random_deadline() },
+        role: Role::Follower {
+            leader: None,
+            election_deadline: random_deadline(election_timeout_min_ms, election_timeout_max_ms),
+        },
         pending: HashMap::new(),
         next_req_id: 1,
         next_snapshot_at,
+        election_timeout_min_ms,
+        election_timeout_max_ms,
     }
 }
 
@@ -465,6 +479,8 @@ struct RaftEngine {
     /// Size limits from Config — re-applied to the store after every snapshot restore.
     max_file_size: u64,
     max_fs_size: u64,
+    /// Configurable timing — how often the leader sends keepalive RPCs.
+    heartbeat_interval: Duration,
     /// Forwarded-request callbacks: request_id → oneshot reply to local proposer.
     client_pending: HashMap<u64, oneshot::Sender<FileOpResult>>,
     /// Responses received from the leader before this follower has applied the
@@ -518,7 +534,7 @@ impl RaftEngine {
         let deadline = match &self.state.role {
             Role::Follower { election_deadline, .. }
             | Role::Candidate { election_deadline, .. } => *election_deadline,
-            Role::Leader { last_heartbeat, .. } => *last_heartbeat + HEARTBEAT_INTERVAL,
+            Role::Leader { last_heartbeat, .. } => *last_heartbeat + self.heartbeat_interval,
         };
         // Convert: compute remaining duration and add to tokio's Instant::now().
         let remaining = deadline.saturating_duration_since(now);
@@ -738,7 +754,7 @@ impl RaftEngine {
             self.state.voted_for = Some(rv.candidate_id);
             self.persist_meta();
             if let Role::Follower { ref mut election_deadline, .. } = self.state.role {
-                *election_deadline = random_deadline();
+                *election_deadline = random_deadline(self.state.election_timeout_min_ms, self.state.election_timeout_max_ms);
             }
         }
 
@@ -780,7 +796,7 @@ impl RaftEngine {
                     self.state.role = Role::Leader {
                         next_index: peer_ids.iter().map(|&id| (id, last_index + 1)).collect(),
                         match_index: peer_ids.iter().map(|&id| (id, 0)).collect(),
-                        last_heartbeat: Instant::now() - HEARTBEAT_INTERVAL,
+                        last_heartbeat: Instant::now() - self.heartbeat_interval,
                         last_replicated_index: last_index,
                     };
                     self.update_pub_state();
@@ -810,7 +826,7 @@ impl RaftEngine {
             match self.state.role {
                 Role::Follower { ref mut leader, ref mut election_deadline } => {
                     *leader = Some(ae.leader_id);
-                    *election_deadline = random_deadline();
+                    *election_deadline = random_deadline(self.state.election_timeout_min_ms, self.state.election_timeout_max_ms);
                 }
                 _ => {
                     self.step_down(ae.term, Some(ae.leader_id));
@@ -987,7 +1003,7 @@ impl RaftEngine {
             self.state.role = Role::Leader {
                 next_index: peer_ids.iter().map(|&id| (id, last_index + 1)).collect(),
                 match_index: peer_ids.iter().map(|&id| (id, 0)).collect(),
-                last_heartbeat: Instant::now() - HEARTBEAT_INTERVAL,
+                last_heartbeat: Instant::now() - self.heartbeat_interval,
                 last_replicated_index: last_index,
             };
             self.update_pub_state();
@@ -996,7 +1012,7 @@ impl RaftEngine {
         }
 
         self.state.role =
-            Role::Candidate { votes, election_deadline: random_deadline() };
+            Role::Candidate { votes, election_deadline: random_deadline(self.state.election_timeout_min_ms, self.state.election_timeout_max_ms) };
         self.update_pub_state();
 
         info!("Starting election for term {}", term);
@@ -1160,7 +1176,7 @@ impl RaftEngine {
             match self.state.role {
                 Role::Follower { ref mut leader, ref mut election_deadline } => {
                     *leader = Some(is.leader_id);
-                    *election_deadline = random_deadline();
+                    *election_deadline = random_deadline(self.state.election_timeout_min_ms, self.state.election_timeout_max_ms);
                 }
                 _ => {
                     self.step_down(is.term, Some(is.leader_id));

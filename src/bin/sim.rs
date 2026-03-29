@@ -258,6 +258,9 @@ async fn main() {
             max_fs_size_bytes: 4 * 1024 * 1024 * 1024,
             snapshot_every: args.snapshot_every as usize,
             persist_every: persist_every as usize,
+            heartbeat_interval_ms: 500,
+            election_timeout_min_ms: 2500,
+            election_timeout_max_ms: 5000,
             mountpoint: None,
             noexec: true,
             nosuid: true,
@@ -278,6 +281,9 @@ async fn main() {
             config.persist_every as u64,
             0, // no per-file size limit in simulation
             0, // no total-fs size limit in simulation
+            config.heartbeat_interval_ms,
+            config.election_timeout_min_ms,
+            config.election_timeout_max_ms,
         );
 
         // Forward inbound cluster messages to the consensus actor.

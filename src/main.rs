@@ -229,7 +229,9 @@ async fn main() {
     let (consensus, msg_tx) =
         Consensus::new(config.algorithm.clone(), cluster_handle.clone(), db, store.clone(),
             config.snapshot_every as u64, config.persist_every as u64,
-            config.max_file_size_bytes, config.max_fs_size_bytes);
+            config.max_file_size_bytes, config.max_fs_size_bytes,
+            config.heartbeat_interval_ms, config.election_timeout_min_ms,
+            config.election_timeout_max_ms);
 
     // ── Status server (Unix socket + periodic file) ───────────────────────
     status::spawn(

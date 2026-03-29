@@ -70,6 +70,22 @@ fn default_persist_every() -> usize {
 
 fn default_true() -> bool { true }
 
+/// Heartbeat interval default: 500 ms.
+///
+/// Similar to pmxcfs/Corosync LAN defaults (token=3000ms /
+/// token_retransmits_before_loss_const=10 ≈ 300 ms per retransmit).
+/// Writes still replicate immediately on proposal; this only governs
+/// idle keepalive frequency.
+fn default_heartbeat_interval_ms() -> u64 { 500 }
+
+/// Election timeout floor default: 2500 ms (5× heartbeat_interval_ms).
+/// Equivalent to the Corosync `consensus` timeout (4800 ms), scaled down
+/// proportionally for a 500 ms heartbeat interval.
+fn default_election_timeout_min_ms() -> u64 { 2500 }
+
+/// Election timeout ceiling default: 5000 ms (10× heartbeat_interval_ms).
+fn default_election_timeout_max_ms() -> u64 { 5000 }
+
 /// Top-level tinycfs.conf configuration.
 ///
 /// Example:
@@ -117,6 +133,30 @@ pub struct Config {
     /// only persists locally at log compaction boundaries.
     #[serde(default = "default_persist_every")]
     pub persist_every: usize,
+    /// How often the leader sends heartbeat / replication RPCs when idle (ms).
+    ///
+    /// Default: 500 ms.  Writes still replicate immediately; this only affects
+    /// idle keepalive frequency and therefore how quickly a dead leader is
+    /// detected.  Increase for very-low-traffic clusters to reduce CPU overhead;
+    /// decrease for faster failover at the cost of more idle traffic.
+    ///
+    /// Similar to pmxcfs/Corosync: token=3000 ms / 10 retransmits ≈ 300 ms
+    /// per retransmit interval on a quiet LAN.
+    #[serde(default = "default_heartbeat_interval_ms")]
+    pub heartbeat_interval_ms: u64,
+    /// Minimum election timeout in ms (default: 2500 = 5× heartbeat_interval_ms).
+    ///
+    /// Must be >> heartbeat_interval_ms.  A follower that receives no message
+    /// for this long starts a new election.  Analogous to the Corosync
+    /// `consensus` timeout (default 4800 ms).
+    #[serde(default = "default_election_timeout_min_ms")]
+    pub election_timeout_min_ms: u64,
+    /// Maximum election timeout in ms (default: 5000 = 10× heartbeat_interval_ms).
+    ///
+    /// Randomised between election_timeout_min_ms and this value to prevent
+    /// split votes.
+    #[serde(default = "default_election_timeout_max_ms")]
+    pub election_timeout_max_ms: u64,
     /// Default FUSE mount point. Used when no mountpoint is passed on the command line.
     #[serde(default)]
     pub mountpoint: Option<String>,
