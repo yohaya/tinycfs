@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -123,12 +124,19 @@ async fn main() {
     //   1. fmt  — structured stdout/stderr output controlled by RUST_LOG
     //   2. syslog — WARN/ERROR events forwarded to the system syslog daemon
     //              (LOG_DAEMON facility), visible in journalctl / /var/log/syslog
+    // Only emit ANSI colour codes when stderr is an interactive terminal.
+    // When running under systemd (stderr → journald pipe) or redirected to
+    // syslog, is_terminal() returns false and the output is plain text.
+    let use_ansi = std::io::stderr().is_terminal();
+
     SyslogLayer::init();
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::fmt::layer().with_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-            ),
+            tracing_subscriber::fmt::layer()
+                .with_ansi(use_ansi)
+                .with_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+                ),
         )
         .with(SyslogLayer)
         .init();
