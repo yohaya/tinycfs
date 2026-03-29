@@ -121,9 +121,20 @@ const TTL: Duration = Duration::from_secs(1);
 impl Filesystem for TinyCfs {
     fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), libc::c_int> {
         // Allow the kernel to send writes up to 4 MiB in a single FUSE call.
-        // Fuser defaults to its MAX_WRITE_SIZE (16 MiB) but being explicit
-        // here documents the choice and aligns with blksize below.
         let _ = config.set_max_write(4 * 1024 * 1024);
+        // Enable kernel writeback cache.
+        //
+        // Without this the kernel passes each application write() call straight
+        // through to FUSE as a separate FUSE_WRITE, regardless of size.
+        // Tools like cp/rsync write in 4–32 KB chunks → every chunk becomes one
+        // Raft round-trip.  For a 256 KB file that is ~64 round-trips × 20 ms
+        // each = ~1.3 seconds just in network latency (~200 KB/s).
+        //
+        // With writeback cache the kernel buffers all writes in the page cache
+        // and flushes on close()/fsync() in one large FUSE_WRITE (up to 4 MiB).
+        // A 256 KB file becomes 1 Raft round-trip → ~20 ms (~12 MB/s at 10 ms
+        // round-trip time). That is a 65× improvement for typical workloads.
+        let _ = config.add_capabilities(fuser::consts::FUSE_WRITEBACK_CACHE);
         Ok(())
     }
 

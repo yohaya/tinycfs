@@ -16,81 +16,7 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # ── Build inside distro-native Docker containers ──────────────────────────
-  build:
-    name: Build · ${{ matrix.name }}
-    runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # ── Debian 12 (bookworm) — current stable, glibc 2.36 ──────────────
-          - name: debian12
-            image: debian:12
-
-          # ── Debian 11 (bullseye) — previous stable, glibc 2.31 ─────────────
-          - name: debian11
-            image: debian:11
-
-          # ── Ubuntu 22.04 LTS (jammy) — glibc 2.35 ──────────────────────────
-          - name: ubuntu22
-            image: ubuntu:22.04
-
-          # ── Ubuntu 24.04 LTS (noble) — glibc 2.38 ──────────────────────────
-          - name: ubuntu24
-            image: ubuntu:24.04
-
-    steps:
-      # ── Checkout on the host runner (modern Node available) ──────────────
-      - uses: actions/checkout@v4
-
-      # ── Build inside the target container ────────────────────────────────
-      - name: Build in ${{ matrix.name }} container
-        run: |
-          docker run --rm \
-            -v "$GITHUB_WORKSPACE:/src" \
-            -w /src \
-            --env CARGO_TERM_COLOR=always \
-            --env TINYCFS_BUILD_NUMBER=${{ github.run_number }} \
-            --env TINYCFS_GIT_SHA=${{ github.sha }} \
-            --env TINYCFS_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            "${{ matrix.image }}" \
-            bash -eux -c '
-              export DEBIAN_FRONTEND=noninteractive
-              apt-get update -qq
-              apt-get install -y -qq \
-                curl \
-                build-essential \
-                pkg-config \
-                libfuse-dev \
-                ca-certificates \
-                git
-
-              # Install Rust
-              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
-                | sh -s -- -y --default-toolchain stable --profile minimal
-              source "$HOME/.cargo/env"
-
-              # Compile release binary
-              cargo build --release --locked 2>&1
-
-              # Quick smoke-test: binary exists and --help works
-              ./target/release/tinycfs --help || true
-
-              # Copy out with distro label so artifact names are unique
-              cp target/release/tinycfs /src/tinycfs-${{ matrix.name }}-x86_64
-            '
-
-      # ── Upload per-distro artifact ────────────────────────────────────────
-      - name: Upload binary (${{ matrix.name }})
-        uses: actions/upload-artifact@v4
-        with:
-          name: tinycfs-${{ matrix.name }}-x86_64
-          path: tinycfs-${{ matrix.name }}-x86_64
-          if-no-files-found: error
-
-  # ── Static musl binary (zero glibc dependency) ───────────────────────────
+  # ── Static musl binary (zero glibc dependency, runs on any Linux) ─────────
   build-musl:
     name: Build · musl-static
     runs-on: ubuntu-latest
@@ -121,20 +47,20 @@ jobs:
         run: ./target/x86_64-unknown-linux-musl/release/tinycfs --help || true
 
       - name: Copy artifact
-        run: cp target/x86_64-unknown-linux-musl/release/tinycfs tinycfs-musl-x86_64
+        run: cp target/x86_64-unknown-linux-musl/release/tinycfs tinycfs-linux-x86_64
 
       - name: Upload binary (musl-static)
         uses: actions/upload-artifact@v4
         with:
-          name: tinycfs-musl-x86_64
-          path: tinycfs-musl-x86_64
+          name: tinycfs-linux-x86_64
+          path: tinycfs-linux-x86_64
           if-no-files-found: error
 
-  # ── Commit all binaries to bin/ in the repository ────────────────────────
+  # ── Commit binary to bin/ in the repository ──────────────────────────────
   publish-bin:
     name: Publish bin/
     runs-on: ubuntu-latest
-    needs: [build, build-musl]
+    needs: [build-musl]
     if: github.ref == 'refs/heads/main'
 
     permissions:
@@ -145,38 +71,34 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Download all tinycfs-* artifacts into bin/ in one shot
       - uses: actions/download-artifact@v4
         with:
           pattern: tinycfs-*
           path: bin/
           merge-multiple: true
 
-      - name: Rename musl artifact to canonical static name
-        run: mv bin/tinycfs-musl-x86_64 bin/tinycfs-linux-x86_64
-
-      - name: Make all binaries executable
+      - name: Make binary executable
         run: chmod +x bin/tinycfs-*
 
       - name: List bin/
         run: ls -lh bin/
 
-      - name: Commit and push binaries
+      - name: Commit and push binary
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add bin/
           git diff --cached --quiet \
-            && echo "binaries unchanged, nothing to commit" \
+            && echo "binary unchanged, nothing to commit" \
             && exit 0
-          git commit -m "ci: update bin/ binaries [skip ci]"
+          git commit -m "ci: update bin/ binary [skip ci]"
           git push
 
-  # ── Collect all binaries into a single release artifact ──────────────────
+  # ── Create release tarball ────────────────────────────────────────────────
   package:
     name: Package release bundle
     runs-on: ubuntu-latest
-    needs: [build, build-musl]
+    needs: [build-musl]
     if: github.ref == 'refs/heads/main'
 
     steps:

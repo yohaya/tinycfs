@@ -182,6 +182,83 @@
   // Has no effect on Totem: Totem snapshots on every ring reform (not periodic).
   snapshot_every: 10000,
 
+  // persist_every  (optional — default: 1)
+  //
+  // Write the FileStore delta to SQLite every N committed Raft entries.
+  //
+  // The default of 1 means every write acknowledged to the client is immediately
+  // durable on THIS node's local disk — zero per-node data loss even if the
+  // process crashes right after replying.
+  //
+  // In a properly-configured cluster (≥ 3 nodes), Raft quorum already guarantees
+  // that any committed write is on a majority of nodes.  If you are comfortable
+  // relying on that — i.e. a node that crashes will re-sync from the leader —
+  // you can raise persist_every to reduce I/O dramatically.
+  //
+  // Options:
+  //       1   — zero per-node data loss (default)
+  //     100   — ~100x less SQLite I/O; node relies on quorum for durability
+  //   10000   — persist only at snapshot boundaries (maximum throughput)
+  //
+  // Must be ≤ snapshot_every.  Has no effect when data_dir is not set.
+  persist_every: 1,
+
+
+  // ── Raft timing ────────────────────────────────────────────────────────────
+
+  // heartbeat_interval_ms  (optional — default: 500)
+  //
+  // How often (in milliseconds) the Raft leader sends keepalive heartbeats to
+  // followers when idle (no new writes pending).
+  //
+  // This controls only idle traffic.  When writes are proposed they replicate
+  // immediately without waiting for the next heartbeat.
+  //
+  // Analogy to pmxcfs/Corosync: Corosync uses token=3000ms with 10 retransmits
+  // before declaring a node lost — effectively a ~300ms retransmit interval.
+  // 500ms is slightly more conservative and works well on a typical LAN.
+  //
+  // Trade-offs:
+  //   Lower value  → faster dead-leader detection; more idle CPU/network.
+  //   Higher value → less idle overhead; slower failover after leader crash.
+  //
+  // election_timeout_min_ms should always be ≥ 5× heartbeat_interval_ms.
+  //
+  // Options (ms):
+  //   100   — etcd default; aggressive (100 × 2 = 200 ms min election timeout)
+  //   500   — recommended for LAN clusters; low idle CPU overhead (default)
+  //  1000   — very quiet clusters; failover in ~3–6 s
+  heartbeat_interval_ms: 500,
+
+  // election_timeout_min_ms  (optional — default: 2500)
+  //
+  // Minimum time (ms) a follower waits without a heartbeat before starting an
+  // election.  Actual timeout is randomised between min and max to prevent
+  // simultaneous elections (split votes).
+  //
+  // Rule of thumb: min = 5× heartbeat_interval_ms, max = 10× heartbeat_interval_ms.
+  // These ratios are the Raft paper's recommended 10–20× range, scaled for the
+  // 500ms heartbeat default.
+  //
+  // Analogous to the Corosync consensus timeout (default: 4800ms).
+  //
+  // Options (ms):
+  //    500   — if heartbeat_interval_ms = 100 (etcd ratio)
+  //   2500   — default (5× 500ms heartbeat)
+  //   5000   — slower but more resilient under very high load
+  election_timeout_min_ms: 2500,
+
+  // election_timeout_max_ms  (optional — default: 5000)
+  //
+  // Maximum election timeout in ms.  Randomised between min and this value per
+  // follower to spread out election attempts and avoid split votes.
+  //
+  // Options (ms):
+  //   1000   — if heartbeat_interval_ms = 100
+  //   5000   — default (10× 500ms heartbeat)
+  //  10000   — very conservative; longer failover window
+  election_timeout_max_ms: 5000,
+
 
   // ── Mount point ───────────────────────────────────────────────────────────
 
@@ -301,23 +378,27 @@
 // QUICK REFERENCE — all fields at a glance
 // ─────────────────────────────────────────────────────────────────────────────
 //
-//  Field                 Type     Default    Required   Valid values
-//  ────────────────────────────────────────────────────────────────────────────
-//  cluster_name          string   —          YES        any non-empty string
-//  local_node            string   —          YES        must match a nodes[].name
-//  data_dir              string   null       no         any writable directory path
-//  algorithm             string   "raft"     no         "raft" | "totem"
-//  max_file_size_bytes   integer  8388608    no         1 – 10485760 (bytes)
-//  max_fs_size_bytes     integer  1073741824 no         bytes; total across all files
-//  snapshot_every        integer  10000      no         100 – 1000000
-//  mountpoint            string   null       no         FUSE mount directory path
-//  noexec                bool     true       no         disallow execution on mount
-//  nosuid                bool     true       no         disallow setuid/setgid
-//  nodev                 bool     true       no         disallow device files
-//  nodes[].name          string   —          YES        unique, stable identifier
-//  nodes[].ip            string   —          YES        reachable LAN IP address
-//  nodes[].port          integer  7788       no         1024 – 65535
-//  nodes[].observer      bool     false      no         true | false
+//  Field                    Type     Default     Required   Valid values
+//  ─────────────────────────────────────────────────────────────────────────────
+//  cluster_name             string   —           YES        any non-empty string
+//  local_node               string   —           YES        must match a nodes[].name
+//  data_dir                 string   null        no         any writable directory path
+//  algorithm                string   "raft"      no         "raft" | "totem"
+//  max_file_size_bytes      integer  8388608     no         1 – 10485760 (bytes)
+//  max_fs_size_bytes        integer  1073741824  no         bytes; total across all files
+//  snapshot_every           integer  10000       no         100 – 1000000
+//  persist_every            integer  1           no         1 – snapshot_every
+//  heartbeat_interval_ms    integer  500         no         50 – 5000 ms
+//  election_timeout_min_ms  integer  2500        no         ≥ 5 × heartbeat_interval_ms
+//  election_timeout_max_ms  integer  5000        no         ≥ election_timeout_min_ms
+//  mountpoint               string   null        no         FUSE mount directory path
+//  noexec                   bool     true        no         disallow execution on mount
+//  nosuid                   bool     true        no         disallow setuid/setgid
+//  nodev                    bool     true        no         disallow device files
+//  nodes[].name             string   —           YES        unique, stable identifier
+//  nodes[].ip               string   —           YES        reachable LAN IP address
+//  nodes[].port             integer  7788        no         1024 – 65535
+//  nodes[].observer         bool     false       no         true | false
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // FAULT TOLERANCE vs. CLUSTER SIZE

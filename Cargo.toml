@@ -24,7 +24,7 @@ path = "src/bin/sim.rs"
 # musl builds use this directly (zero-C pure-rust FUSE impl via /dev/fuse).
 # Non-musl builds (glibc Linux, macOS) additionally enable libfuse via the
 # target-specific section at the bottom of this file.
-fuser = { version = "0.14", default-features = false }
+fuser = { version = "0.14", default-features = false, features = ["abi-7-23"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -68,7 +68,7 @@ crossbeam-channel = "0.5"
 # Re-enable the libfuse C backend on glibc Linux and macOS.
 # musl targets keep default-features=false and use the pure-rust FUSE impl.
 [target.'cfg(not(target_env = "musl"))'.dependencies]
-fuser = { version = "0.14", default-features = false, features = ["libfuse"] }
+fuser = { version = "0.14", default-features = false, features = ["libfuse", "abi-7-23"] }
 
 [profile.release]
 opt-level = 3
