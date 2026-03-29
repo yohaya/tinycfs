@@ -386,13 +386,7 @@ fn load_state_from_db(db: &RaftDb, store: &Arc<RwLock<FileStore>>, snapshot_ever
     let (snapshot_index, snapshot_term) = match db.load_fs_state() {
         Ok(Some((inode_rows, next_ino, total_bytes, si, st))) => {
             let inodes: std::collections::HashMap<crate::fs::inode::Ino, crate::fs::inode::Inode> =
-                inode_rows.into_iter()
-                    .filter_map(|(ino, data)| {
-                        bincode::deserialize::<crate::fs::inode::Inode>(&data)
-                            .ok()
-                            .map(|inode| (ino, inode))
-                    })
-                    .collect();
+                inode_rows.into_iter().collect();
             let loaded = FileStore::from_parts(inodes, next_ino, total_bytes);
             *store.write() = loaded;
             info!("Loaded per-inode state at index {} (term {})", si, st);
@@ -1206,10 +1200,16 @@ impl RaftEngine {
                 warn!("InstallSnapshot: blob DB save failed, ignoring snapshot: {}", e);
                 return;
             }
-            // Per-inode table — atomically replaces all rows.
-            let inodes: Vec<(u64, Vec<u8>)> = snap_store.inodes().iter()
+            // Per-inode table — atomically replaces all rows using meta/data split.
+            use crate::fs::inode::{Inode, InodePersistMeta};
+            let inodes: Vec<(u64, Vec<u8>, Option<Vec<u8>>)> = snap_store.inodes().iter()
                 .filter_map(|(ino, inode)| {
-                    bincode::serialize(inode).ok().map(|d| (*ino, d))
+                    let meta = bincode::serialize(&InodePersistMeta::from_inode(inode)).ok()?;
+                    let data = match inode {
+                        Inode::File(f) => Some(f.data.clone()),
+                        _              => None,
+                    };
+                    Some((*ino, meta, data))
                 })
                 .collect();
             if let Err(e) = db.apply_full_inode_snapshot(
@@ -1224,20 +1224,11 @@ impl RaftEngine {
             }
         }
 
-        // Apply the snapshot to the state machine (reuse the already-deserialized store).
+        // Apply the snapshot to the state machine.
         {
             let mut st = self.store.write();
-            // Re-deserialize into the store to avoid partially moving snap_store above.
-            match bincode::deserialize::<crate::fs::store::FileStore>(&is.data) {
-                Ok(s) => {
-                    *st = s;
-                    st.set_limits(self.max_file_size, self.max_fs_size);
-                }
-                Err(e) => {
-                    warn!("InstallSnapshot: in-memory apply failed: {}", e);
-                    return;
-                }
-            }
+            *st = snap_store;
+            st.set_limits(self.max_file_size, self.max_fs_size);
         }
 
         // Compact the log to the snapshot boundary and reset applied state.
@@ -1395,32 +1386,50 @@ impl RaftEngine {
     /// on-disk state is anchored — even when the dirty sets happen to be empty
     /// (e.g. compact_log calling after a batch that was already persisted).
     fn persist_store(&mut self, snap_index: LogIndex, snap_term: Term) {
-        let db = match &mut self.db { Some(d) => d, None => return };
+        if self.db.is_none() { return; }
 
-        // Drain dirty sets (brief write lock — just swaps two HashSets).
-        let (dirty_set, deleted_set) = {
+        // Drain dirty sets (brief write lock — just swaps three HashSets).
+        let (dirty_set, data_dirty_set, deleted_set) = {
             let mut st = self.store.write();
             st.drain_dirty()
         };
 
-        // Serialise dirty inodes and read bookkeeping (read lock).
+        // Build the delta while holding a read lock.
+        // For each dirty inode: always serialize the small meta blob;
+        // only clone the large data blob when file content actually changed.
         let (dirty, deleted, next_ino, total_bytes) = {
+            use crate::fs::inode::{Inode, InodePersistMeta};
             let st = self.store.read();
-            let dirty: Vec<(u64, Vec<u8>)> = dirty_set.iter()
+            let dirty: Vec<(u64, Vec<u8>, Option<Vec<u8>>)> = dirty_set.iter()
                 .filter_map(|&ino| {
-                    st.get(ino)
-                        .and_then(|inode| bincode::serialize(inode).ok().map(|d| (ino, d)))
+                    let inode = st.get(ino)?;
+                    let meta = bincode::serialize(&InodePersistMeta::from_inode(inode)).ok()?;
+                    let data = if data_dirty_set.contains(&ino) {
+                        match inode {
+                            Inode::File(f) => Some(f.data.clone()),
+                            _              => None,
+                        }
+                    } else {
+                        None
+                    };
+                    Some((ino, meta, data))
                 })
                 .collect();
             let deleted: Vec<u64> = deleted_set.into_iter().collect();
             (dirty, deleted, st.next_ino_val(), st.total_data_bytes())
         };
 
-        if let Err(e) = db.apply_inode_delta(
-            &dirty, &deleted, next_ino, total_bytes, snap_index, snap_term,
-        ) {
-            warn!("FileStore delta persist failed at index {}: {}", snap_index, e);
-        }
+        // Write to SQLite.  block_in_place tells the tokio runtime that this
+        // thread may block (on WAL writes / checkpoint fsyncs) so it can move
+        // other async tasks to different threads during the I/O.
+        let db = self.db.as_mut().unwrap();
+        tokio::task::block_in_place(|| {
+            if let Err(e) = db.apply_inode_delta(
+                &dirty, &deleted, next_ino, total_bytes, snap_index, snap_term,
+            ) {
+                warn!("FileStore delta persist failed at index {}: {}", snap_index, e);
+            }
+        });
     }
 
     /// Compact the in-memory Raft log up to last_applied.

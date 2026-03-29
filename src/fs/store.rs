@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cluster::message::FileOp;
 use crate::error::{Result, TinyCfsError};
-use crate::fs::inode::{DirInode, FileInode, Ino, InoKind, Inode, InodeMeta, SymlinkInode};
+use crate::fs::inode::{DirInode, FileInode, Ino, InoKind, Inode, InodeMeta, SymlinkInode, InodePersistMeta};
 
 /// Root inode is always 1 (FUSE convention).
 pub const ROOT_INO: Ino = 1;
@@ -66,6 +66,10 @@ pub struct FileStore {
     // Not serialized — rebuilt from applied ops, never snapshotted.
     #[serde(skip, default)]
     dirty_inodes: HashSet<Ino>,
+    /// Subset of dirty_inodes where file *data* changed (write/truncate/create).
+    /// Used to skip re-writing the large data blob for metadata-only mutations.
+    #[serde(skip, default)]
+    data_dirty_inodes: HashSet<Ino>,
     #[serde(skip, default)]
     deleted_inodes: HashSet<Ino>,
 }
@@ -97,6 +101,7 @@ impl FileStore {
             max_file_size_bytes: 0,
             max_fs_size_bytes: 0,
             dirty_inodes,
+            data_dirty_inodes: HashSet::new(),
             deleted_inodes: HashSet::new(),
         }
     }
@@ -112,6 +117,7 @@ impl FileStore {
             max_file_size_bytes: 0,
             max_fs_size_bytes: 0,
             dirty_inodes: HashSet::new(),
+            data_dirty_inodes: HashSet::new(),
             deleted_inodes: HashSet::new(),
         }
     }
@@ -167,15 +173,29 @@ impl FileStore {
 
     /// Drain the dirty-inode sets accumulated since the last persist call.
     ///
-    /// Returns `(dirty_set, deleted_set)` where `dirty_set` holds ino numbers
-    /// of inodes that were created or modified, and `deleted_set` holds ino
-    /// numbers of inodes that were removed.  Callers look up and serialise each
-    /// dirty inode before passing it to the persistence layer.
-    pub fn drain_dirty(&mut self) -> (HashSet<Ino>, HashSet<Ino>) {
+    /// Returns `(dirty_set, data_dirty_set, deleted_set)` where:
+    /// - `dirty_set`      — every inode that was created or mutated (always persists metadata)
+    /// - `data_dirty_set` — subset of dirty_set where file *data* changed (write/truncate)
+    /// - `deleted_set`    — inodes removed from the filesystem
+    pub fn drain_dirty(&mut self) -> (HashSet<Ino>, HashSet<Ino>, HashSet<Ino>) {
         (
             std::mem::take(&mut self.dirty_inodes),
+            std::mem::take(&mut self.data_dirty_inodes),
             std::mem::take(&mut self.deleted_inodes),
         )
+    }
+
+    /// Returns a reference to the `InodePersistMeta` accessor (used by persistence).
+    pub fn persist_meta_for(&self, ino: Ino) -> Option<InodePersistMeta> {
+        self.inodes.get(&ino).map(InodePersistMeta::from_inode)
+    }
+
+    /// Returns the raw file data bytes for a file inode (used by persistence).
+    pub fn file_data_for(&self, ino: Ino) -> Option<&[u8]> {
+        match self.inodes.get(&ino) {
+            Some(Inode::File(f)) => Some(&f.data),
+            _ => None,
+        }
     }
 
     pub fn readdir(&self, ino: Ino) -> Result<Vec<(String, Ino, InoKind)>> {
@@ -340,6 +360,7 @@ impl FileStore {
             dir.meta.mtime = SystemTime::now();
         }
         self.dirty_inodes.insert(ino);
+        self.data_dirty_inodes.insert(ino); // new file — data column must be created
         self.dirty_inodes.insert(parent_ino);
         Ok(())
     }
@@ -421,6 +442,7 @@ impl FileStore {
                 self.total_data_bytes =
                     self.total_data_bytes.saturating_add(new_size).saturating_sub(old_size);
                 self.dirty_inodes.insert(ino);
+                self.data_dirty_inodes.insert(ino);
                 Ok(())
             }
             Some(_) => Err(TinyCfsError::IsDirectory),
@@ -450,6 +472,7 @@ impl FileStore {
                 self.total_data_bytes =
                     self.total_data_bytes.saturating_add(size).saturating_sub(old_size);
                 self.dirty_inodes.insert(ino);
+                self.data_dirty_inodes.insert(ino);
                 Ok(())
             }
             Some(_) => Err(TinyCfsError::IsDirectory),
@@ -552,6 +575,7 @@ impl FileStore {
                 f.meta.mtime = now;
                 self.total_data_bytes =
                     self.total_data_bytes.saturating_add(size).saturating_sub(old_size);
+                self.data_dirty_inodes.insert(ino);
             }
         }
         if let Some(inode) = self.inodes.get_mut(&ino) {

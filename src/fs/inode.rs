@@ -94,6 +94,39 @@ pub enum Inode {
     Symlink(SymlinkInode),
 }
 
+/// Split representation for SQLite persistence: inode metadata without the
+/// embedded file data blob.  Stored in the `meta` column of `fs_inodes`.
+///
+/// Separating meta from data means metadata-only mutations (rename, chmod,
+/// setattr) only rewrite the tiny meta blob (~60 bytes), not the full file
+/// content, regardless of file size.  File data lives in the `data` column
+/// and is only rewritten when the content actually changes (write/truncate).
+#[derive(Debug, Serialize, Deserialize)]
+pub enum InodePersistMeta {
+    File(InodeMeta),
+    Dir(DirInode),
+    Symlink(SymlinkInode),
+}
+
+impl InodePersistMeta {
+    pub fn from_inode(inode: &Inode) -> Self {
+        match inode {
+            Inode::File(f)    => InodePersistMeta::File(f.meta.clone()),
+            Inode::Dir(d)     => InodePersistMeta::Dir(d.clone()),
+            Inode::Symlink(s) => InodePersistMeta::Symlink(s.clone()),
+        }
+    }
+
+    pub fn into_inode(self, data: Option<Vec<u8>>) -> Inode {
+        match self {
+            InodePersistMeta::File(meta) =>
+                Inode::File(FileInode { meta, data: data.unwrap_or_default() }),
+            InodePersistMeta::Dir(d)     => Inode::Dir(d),
+            InodePersistMeta::Symlink(s) => Inode::Symlink(s),
+        }
+    }
+}
+
 impl Inode {
     pub fn meta(&self) -> &InodeMeta {
         match self {

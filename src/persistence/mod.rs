@@ -6,15 +6,24 @@
 //!      for Raft safety (prevents double-voting / accepting a stale leader).
 //!
 //!   2. **FileStore state** — stored as *one row per inode* in `fs_inodes`,
-//!      not as a single serialised blob.  On each committed batch only the
-//!      inodes that actually changed are written: O(changed_files_in_batch)
-//!      instead of O(total_filesystem_size).  With `persist_every=1` (the
-//!      default) every write is immediately durable at O(1) cost regardless
-//!      of how many other files exist.
+//!      split across two columns:
 //!
-//!      The old `fs_snapshot` blob table is retained for two purposes:
-//!        - receiving `InstallSnapshot` from a leader (full state transfer)
-//!        - reading databases written by an older version of tinycfs
+//!      - `meta`  BLOB — `bincode(InodePersistMeta)` (~60 bytes): always
+//!                       rewritten on any mutation.
+//!      - `data`  BLOB — raw file bytes: only rewritten when file content
+//!                       changes (write/truncate/create).
+//!
+//!      This split means a `chmod`, `rename`, or `setattr` on a 256 KiB file
+//!      writes only the tiny metadata blob, not the full file content.
+//!
+//! SQLite tuning applied in `open()`:
+//!   - WAL journal mode — writers never block readers.
+//!   - `synchronous = NORMAL` — WAL appends without fsync; checkpoint fsyncs.
+//!   - `wal_autocheckpoint = 10 000` pages (40 MB) — 10× fewer checkpoint
+//!     fsyncs than the default 1 000-page threshold, which fired every ~14
+//!     commits at 256 KiB blob size.
+//!   - `cache_size = -32 000` (32 MB) — reduces page reads during upserts.
+//!   - `mmap_size = 268 435 456` (256 MB) — memory-mapped reads.
 //!
 //! On restart:
 //!   1. Load all rows from `fs_inodes` → rebuild the in-memory FileStore.
@@ -27,6 +36,7 @@ use std::path::Path;
 
 use crate::cluster::message::{LogIndex, NodeId, Term};
 use crate::error::{Result, TinyCfsError};
+use crate::fs::inode::{Inode, InodePersistMeta};
 
 pub struct RaftDb {
     conn: Connection,
@@ -41,35 +51,64 @@ impl RaftDb {
         let conn = Connection::open(path)
             .map_err(|e| TinyCfsError::Io(e.to_string()))?;
 
+        // Performance pragmas (must precede table creation).
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous   = NORMAL;
-             PRAGMA cache_size    = -4000;
+            "PRAGMA journal_mode       = WAL;
+             PRAGMA synchronous        = NORMAL;
+             PRAGMA cache_size         = -32000;
+             PRAGMA mmap_size          = 268435456;
+             PRAGMA wal_autocheckpoint = 10000;",
+        )
+        .map_err(|e| TinyCfsError::Io(e.to_string()))?;
 
-             CREATE TABLE IF NOT EXISTS raft_meta (
+        // Create all supporting tables.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS raft_meta (
                  key   TEXT PRIMARY KEY,
                  value INTEGER NOT NULL
              ) WITHOUT ROWID;
 
-             -- Per-inode table: one row per inode, bincode-encoded Inode struct.
-             -- Replaces the old single-blob fs_snapshot for normal write path.
-             CREATE TABLE IF NOT EXISTS fs_inodes (
-                 ino  INTEGER PRIMARY KEY,
-                 data BLOB NOT NULL
-             );
-
-             -- FileStore bookkeeping: next_ino, total_bytes, snapshot_index, snapshot_term.
              CREATE TABLE IF NOT EXISTS fs_meta (
                  key   TEXT PRIMARY KEY,
                  value INTEGER NOT NULL
              ) WITHOUT ROWID;
 
-             -- Legacy blob snapshot: used for InstallSnapshot and backwards-compat reads.
              CREATE TABLE IF NOT EXISTS fs_snapshot (
                  id             INTEGER PRIMARY KEY CHECK (id = 1),
                  snapshot_index INTEGER NOT NULL,
                  snapshot_term  INTEGER NOT NULL,
                  data           BLOB    NOT NULL
+             );",
+        )
+        .map_err(|e| TinyCfsError::Io(e.to_string()))?;
+
+        // Detect old fs_inodes schema (single 'data' column, no 'meta' column).
+        // If found, drop and recreate — the node will replay state from the leader.
+        let table_exists: bool = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='fs_inodes'",
+            [],
+            |r| r.get::<_, i64>(0),
+        ).unwrap_or(0) > 0;
+
+        if table_exists {
+            let meta_col_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('fs_inodes') WHERE name='meta'",
+                [],
+                |r| r.get(0),
+            ).unwrap_or(0);
+            if meta_col_count == 0 {
+                // Old schema — drop so the new CREATE TABLE below runs cleanly.
+                conn.execute_batch("DROP TABLE fs_inodes; DELETE FROM fs_meta;")
+                    .map_err(|e| TinyCfsError::Io(e.to_string()))?;
+            }
+        }
+
+        // Per-inode table with meta/data split.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS fs_inodes (
+                 ino  INTEGER PRIMARY KEY,
+                 meta BLOB NOT NULL,
+                 data BLOB
              );",
         )
         .map_err(|e| TinyCfsError::Io(e.to_string()))?;
@@ -134,18 +173,16 @@ impl RaftDb {
 
     /// Write the delta from a committed Raft batch to SQLite in one transaction.
     ///
-    /// `dirty` — (ino, bincode-serialized Inode) for every inode created or
-    ///           modified in the batch.
+    /// `dirty` — per-inode tuples `(ino, meta_blob, data_blob)`:
+    ///   - `meta_blob` — `bincode(InodePersistMeta)` — always written (~60 B)
+    ///   - `data_blob` — `Some(bytes)` when file content changed (write/truncate);
+    ///                   `None` for metadata-only mutations — the existing data
+    ///                   column value is left untouched.
     /// `deleted` — inode numbers that were removed from the filesystem.
-    ///
-    /// `snap_index` / `snap_term` are always written to `fs_meta` so that on
-    /// restart the engine knows where in the Raft log the on-disk state is
-    /// anchored (even when dirty and deleted are both empty, e.g. after a log
-    /// compaction whose data was already persisted by a prior call).
     pub fn apply_inode_delta(
         &mut self,
-        dirty:       &[(u64, Vec<u8>)],  // (ino, bincode-encoded Inode)
-        deleted:     &[u64],             // ino numbers to remove
+        dirty:       &[(u64, Vec<u8>, Option<Vec<u8>>)],
+        deleted:     &[u64],
         next_ino:    u64,
         total_bytes: u64,
         snap_index:  LogIndex,
@@ -154,12 +191,28 @@ impl RaftDb {
         let tx = self.conn.transaction()
             .map_err(|e| TinyCfsError::Io(e.to_string()))?;
 
-        for (ino, data) in dirty {
-            tx.execute(
-                "INSERT OR REPLACE INTO fs_inodes (ino, data) VALUES (?1, ?2)",
-                params![*ino as i64, data],
-            ).map_err(|e| TinyCfsError::Io(e.to_string()))?;
+        for (ino, meta, data) in dirty {
+            match data {
+                Some(d) => {
+                    // Data changed — upsert both meta and data.
+                    tx.execute(
+                        "INSERT INTO fs_inodes (ino, meta, data) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(ino) DO UPDATE SET meta = excluded.meta,
+                                                        data = excluded.data",
+                        params![*ino as i64, meta, d],
+                    ).map_err(|e| TinyCfsError::Io(e.to_string()))?;
+                }
+                None => {
+                    // Metadata only — upsert meta, leave data column intact.
+                    tx.execute(
+                        "INSERT INTO fs_inodes (ino, meta) VALUES (?1, ?2)
+                         ON CONFLICT(ino) DO UPDATE SET meta = excluded.meta",
+                        params![*ino as i64, meta],
+                    ).map_err(|e| TinyCfsError::Io(e.to_string()))?;
+                }
+            }
         }
+
         for ino in deleted {
             tx.execute(
                 "DELETE FROM fs_inodes WHERE ino = ?1",
@@ -186,11 +239,9 @@ impl RaftDb {
     /// Atomically replace the entire `fs_inodes` table with the given set.
     ///
     /// Called when the node receives an InstallSnapshot from the leader.
-    /// Clears the old table and writes the full snapshot in one transaction
-    /// so the on-disk state is never partially applied.
     pub fn apply_full_inode_snapshot(
         &mut self,
-        inodes:      &[(u64, Vec<u8>)],  // (ino, bincode-encoded Inode)
+        inodes:      &[(u64, Vec<u8>, Option<Vec<u8>>)],  // (ino, meta_blob, data_blob?)
         next_ino:    u64,
         total_bytes: u64,
         snap_index:  LogIndex,
@@ -202,10 +253,10 @@ impl RaftDb {
         tx.execute("DELETE FROM fs_inodes", [])
             .map_err(|e| TinyCfsError::Io(e.to_string()))?;
 
-        for (ino, data) in inodes {
+        for (ino, meta, data) in inodes {
             tx.execute(
-                "INSERT INTO fs_inodes (ino, data) VALUES (?1, ?2)",
-                params![*ino as i64, data],
+                "INSERT INTO fs_inodes (ino, meta, data) VALUES (?1, ?2, ?3)",
+                params![*ino as i64, meta, data],
             ).map_err(|e| TinyCfsError::Io(e.to_string()))?;
         }
 
@@ -227,11 +278,12 @@ impl RaftDb {
 
     /// Load persisted filesystem state from the per-inode table.
     ///
-    /// Returns `None` when `fs_inodes` is empty — either first boot or a node
-    /// that only has the legacy blob snapshot (see `load_snapshot`).
+    /// Decodes each row's `meta` + `data` columns into a live `Inode`.
+    /// Returns `None` when `fs_inodes` is empty — either first boot or an
+    /// old-schema node that was migrated (see `load_snapshot` for fallback).
     pub fn load_fs_state(
         &self,
-    ) -> Result<Option<(Vec<(u64, Vec<u8>)>, u64, u64, LogIndex, Term)>> {
+    ) -> Result<Option<(Vec<(u64, Inode)>, u64, u64, LogIndex, Term)>> {
         let count: i64 = self.conn
             .query_row("SELECT COUNT(*) FROM fs_inodes", [], |r| r.get(0))
             .map_err(|e| TinyCfsError::Io(e.to_string()))?;
@@ -240,15 +292,22 @@ impl RaftDb {
         }
 
         let mut stmt = self.conn
-            .prepare("SELECT ino, data FROM fs_inodes")
+            .prepare("SELECT ino, meta, data FROM fs_inodes")
             .map_err(|e| TinyCfsError::Io(e.to_string()))?;
 
-        let inodes: Vec<(u64, Vec<u8>)> = stmt
+        let inodes: Vec<(u64, Inode)> = stmt
             .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, Vec<u8>>(1)?))
+                let ino  = row.get::<_, i64>(0)? as u64;
+                let meta = row.get::<_, Vec<u8>>(1)?;
+                let data = row.get::<_, Option<Vec<u8>>>(2)?;
+                Ok((ino, meta, data))
             })
             .map_err(|e| TinyCfsError::Io(e.to_string()))?
             .filter_map(|r| r.ok())
+            .filter_map(|(ino, meta, data)| {
+                let pm: InodePersistMeta = bincode::deserialize(&meta).ok()?;
+                Some((ino, pm.into_inode(data)))
+            })
             .collect();
 
         let get_meta = |key: &str| -> u64 {
