@@ -112,6 +112,13 @@ struct Args {
     /// Without this flag nodes run purely in-memory (faster, no I/O overhead).
     #[arg(long)]
     with_db: bool,
+
+    /// Payload bytes per write proposal.  Simulates the block size seen by
+    /// Raft: use 4096 to reproduce the old st_blksize=4KiB behaviour and
+    /// 131072 for the new st_blksize=128KiB behaviour.
+    /// Default: 64 (tiny, exercises proposal overhead only).
+    #[arg(long, default_value = "64")]
+    write_size_bytes: usize,
 }
 
 // ─── Per-node handle ──────────────────────────────────────────────────────────
@@ -409,14 +416,20 @@ async fn main() {
         let err = err_count.clone();
         let h = hist.clone();
 
+        let write_size = args.write_size_bytes;
         tokio::spawn(async move {
             let t = Instant::now();
-            // Mix writes and creates to exercise different code paths.
             let path = format!("/file-{}.txt", seq % 1000);
+            // Payload sized to write_size_bytes so throughput in MB/s is meaningful.
+            let mut data = vec![0u8; write_size];
+            // Stamp seq number in first 8 bytes so each write is unique.
+            let seq_bytes = seq.to_le_bytes();
+            let copy_len = seq_bytes.len().min(data.len());
+            data[..copy_len].copy_from_slice(&seq_bytes[..copy_len]);
             let op = FileOp::Write {
                 path,
                 offset: 0,
-                data: format!("seq={}", seq).into_bytes(),
+                data,
             };
             match consensus.propose(op).await {
                 Ok(()) => { h.record(t.elapsed()); ok.fetch_add(1, Ordering::Relaxed); }
@@ -475,6 +488,12 @@ async fn main() {
             args.heal_at_secs.map(|h| format!("at {}s", h)).unwrap_or_else(|| "never".into()));
     }
     println!(" Target RPS:       {}", args.rps);
+    let write_size_str = if args.write_size_bytes >= 1024 {
+        format!("{} KiB", args.write_size_bytes / 1024)
+    } else {
+        format!("{} B", args.write_size_bytes)
+    };
+    println!(" Write size:       {}", write_size_str);
     println!(" Duration:         {:.1} s", total_elapsed.as_secs_f64());
     println!("───────────────────────────────────────────────────────");
     if let Some((t, rate)) = pre_populate_time {
@@ -485,7 +504,8 @@ async fn main() {
     println!(" Total ops:        {}", total);
     println!(" Succeeded:        {}  ({:.2}%)", ok, success_pct);
     println!(" Failed:           {}", err);
-    println!(" Throughput:       {:.0} ops/s", throughput);
+    let mb_per_sec = throughput * args.write_size_bytes as f64 / (1024.0 * 1024.0);
+    println!(" Throughput:       {:.0} ops/s  ({:.2} MB/s)", throughput, mb_per_sec);
     println!("───────────────────────────────────────────────────────");
     println!(" Latency p50:      {:.1} ms", hist.percentile(50.0).as_secs_f64() * 1000.0);
     println!(" Latency p95:      {:.1} ms", hist.percentile(95.0).as_secs_f64() * 1000.0);

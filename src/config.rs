@@ -57,14 +57,15 @@ fn default_snapshot_every() -> usize {
 }
 
 fn default_persist_every() -> usize {
-    // Write the FileStore snapshot to SQLite every 10 000 applied entries.
+    // Write the FileStore snapshot to SQLite on every committed batch.
     //
-    // Durability rationale: committed data is already replicated on a quorum
-    // of nodes — a node crash before the next snapshot merely causes a resync
-    // from the leader on reconnect (bounded by persist_every entries).  For
-    // single-node deployments where no other node holds the data, set this to
-    // 1 for zero data loss at the cost of O(filesystem_size) I/O per write.
-    10_000
+    // Zero-data-loss default: every write acknowledged to the client is
+    // immediately durable on this node.  For large filesystems (1000+ files)
+    // this triggers O(filesystem_size) I/O per write due to full-snapshot
+    // serialisation; set persist_every to a higher value (e.g. 10 000) to
+    // trade per-node durability for throughput in exchange for relying on
+    // quorum replication for crash recovery.
+    1
 }
 
 fn default_true() -> bool { true }
@@ -110,10 +111,10 @@ pub struct Config {
     pub snapshot_every: usize,
     /// Write the FileStore snapshot to disk every N applied entries.
     ///
-    /// Lower values mean more frequent persistence (better per-node durability,
-    /// higher I/O cost).  Setting to 1 restores "write on every commit" behaviour.
-    /// Must be ≤ snapshot_every; defaults to snapshot_every when omitted.
-    /// For single-node deployments set to 1 to avoid any data loss on crash.
+    /// Default: 1 (zero data loss — every committed write is immediately durable
+    /// on this node).  For large filesystems with many files, increase to reduce
+    /// I/O overhead: e.g. 10 000 relies on quorum replication for durability and
+    /// only persists locally at log compaction boundaries.
     #[serde(default = "default_persist_every")]
     pub persist_every: usize,
     /// Default FUSE mount point. Used when no mountpoint is passed on the command line.
