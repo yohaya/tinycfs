@@ -95,13 +95,31 @@ struct Conn {
 
 /// Optional cluster configuration that affects runtime behaviour.
 ///
-/// Used primarily by the simulation to inject artificial network latency.
-#[derive(Clone, Default)]
+/// Used primarily by the simulation to inject artificial network latency,
+/// packet loss, and network partitions.
+#[derive(Clone)]
 pub struct ClusterOptions {
     /// If set, each outbound message is delayed by a random duration drawn
     /// uniformly from [min, max] before being written to the socket.
     /// Simulates real-world WAN/LAN propagation delay.
     pub network_delay: Option<(Duration, Duration)>,
+    /// Fraction of outbound messages to drop silently (0.0 = none, 1.0 = all).
+    /// Models unreliable links or high-loss wireless networks.
+    pub packet_loss: f64,
+    /// Node IDs whose messages are silently dropped in both directions.
+    /// Shared Arc allows runtime partition injection without reconnection:
+    /// insert a peer ID to partition, remove to heal.
+    pub blocked_peers: Arc<RwLock<HashSet<NodeId>>>,
+}
+
+impl Default for ClusterOptions {
+    fn default() -> Self {
+        ClusterOptions {
+            network_delay: None,
+            packet_loss: 0.0,
+            blocked_peers: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
 }
 
 /// The cluster manager. Owns all TCP connections.
@@ -154,6 +172,8 @@ impl Cluster {
         let cfg2 = config.clone();
         let lid = local_id;
         let delay2 = opts.network_delay;
+        let pl2 = opts.packet_loss;
+        let bp2 = opts.blocked_peers.clone();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -163,7 +183,7 @@ impl Cluster {
                         let peers = peers2.clone();
                         let env_tx = env_tx2.clone();
                         let cfg = cfg2.clone();
-                        tokio::spawn(handle_incoming(stream, lid, cfg, conns, peers, env_tx, delay2));
+                        tokio::spawn(handle_incoming(stream, lid, cfg, conns, peers, env_tx, delay2, pl2, bp2.clone()));
                     }
                     Err(e) => error!("Accept error: {}", e),
                 }
@@ -209,7 +229,9 @@ impl Cluster {
             let env_tx = env_tx.clone();
             let cfg = config.clone();
             let delay = opts.network_delay;
-            tokio::spawn(connect_to_peer(peer, lid, cfg, conns, peers, env_tx, delay));
+            let packet_loss = opts.packet_loss;
+            let blocked_peers = opts.blocked_peers.clone();
+            tokio::spawn(connect_to_peer(peer, lid, cfg, conns, peers, env_tx, delay, packet_loss, blocked_peers));
         }
 
         let handle = ClusterHandle {
@@ -237,6 +259,8 @@ async fn connect_to_peer(
     peers: Arc<RwLock<HashMap<NodeId, String>>>,
     env_tx: mpsc::UnboundedSender<Envelope>,
     delay: Option<(Duration, Duration)>,
+    packet_loss: f64,
+    blocked_peers: Arc<RwLock<HashSet<NodeId>>>,
 ) {
     let peer_id = Config::node_id(&peer.name);
     let mut backoff = Duration::from_millis(500);
@@ -244,6 +268,13 @@ async fn connect_to_peer(
     loop {
         match TcpStream::connect(&peer.addr()).await {
             Ok(mut stream) => {
+                // Disable Nagle's algorithm so small control messages (heartbeats,
+                // vote requests) are not buffered waiting for more data.  Combined
+                // with the single-write framing in writer_task this eliminates the
+                // 40 ms Nagle delay that caused double epoll round-trips per message.
+                if let Err(e) = stream.set_nodelay(true) {
+                    warn!("TCP_NODELAY for {}: {}", peer.name, e);
+                }
                 info!("Connected to {} ({})", peer.name, peer.addr());
 
                 // Send Hello
@@ -286,10 +317,10 @@ async fn connect_to_peer(
 
                 // Writer task
                 let peer_name2 = peer.name.clone();
-                tokio::spawn(writer_task(write_half, rx, peer_name2, delay));
+                tokio::spawn(writer_task(write_half, rx, peer_name2, peer_id, delay, packet_loss, blocked_peers.clone()));
 
                 // Reader task (blocks until connection drops)
-                reader_task(read_half, peer_id, env_tx.clone()).await;
+                reader_task(read_half, peer_id, env_tx.clone(), blocked_peers.clone()).await;
 
                 warn!("Connection to {} dropped, reconnecting…", peer.name);
                 conns.write().remove(&peer_id);
@@ -314,7 +345,12 @@ async fn handle_incoming(
     peers: Arc<RwLock<HashMap<NodeId, String>>>,
     env_tx: mpsc::UnboundedSender<Envelope>,
     delay: Option<(Duration, Duration)>,
+    packet_loss: f64,
+    blocked_peers: Arc<RwLock<HashSet<NodeId>>>,
 ) {
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!("TCP_NODELAY on accepted connection: {}", e);
+    }
     // Expect Hello
     let (peer_id, peer_name) = match recv_msg(&mut stream).await {
         Ok(Message::Hello { node_id, name, cluster_name }) => {
@@ -350,10 +386,10 @@ async fn handle_incoming(
     peers.write().insert(peer_id, peer_name.clone());
 
     // Writer task
-    tokio::spawn(writer_task(write_half, rx, peer_name.clone(), delay));
+    tokio::spawn(writer_task(write_half, rx, peer_name.clone(), peer_id, delay, packet_loss, blocked_peers.clone()));
 
     // Reader task
-    reader_task(read_half, peer_id, env_tx).await;
+    reader_task(read_half, peer_id, env_tx, blocked_peers).await;
 
     info!("Peer {} disconnected", peer_name);
     conns.write().remove(&peer_id);
@@ -365,6 +401,7 @@ async fn reader_task(
     mut read_half: tokio::net::tcp::OwnedReadHalf,
     peer_id: NodeId,
     env_tx: mpsc::UnboundedSender<Envelope>,
+    blocked_peers: Arc<RwLock<HashSet<NodeId>>>,
 ) {
     // We need a full TcpStream for recv_msg, so wrap with a helper that works
     // on the read half.
@@ -390,7 +427,10 @@ async fn reader_task(
         }
         match bincode::deserialize::<Message>(&buf) {
             Ok(msg) => {
-                let _ = env_tx.send(Envelope { from: peer_id, msg });
+                // Partition simulation: drop inbound messages from blocked peers.
+                if !blocked_peers.read().contains(&peer_id) {
+                    let _ = env_tx.send(Envelope { from: peer_id, msg });
+                }
             }
             Err(e) => {
                 warn!("Deserialization error from peer {:x}: {}", peer_id, e);
@@ -422,7 +462,10 @@ async fn writer_task(
     mut write_half: tokio::net::tcp::OwnedWriteHalf,
     mut rx: mpsc::UnboundedReceiver<(Instant, Message)>,
     peer_name: String,
+    peer_id: NodeId,
     delay: Option<(Duration, Duration)>,
+    packet_loss: f64,
+    blocked_peers: Arc<RwLock<HashSet<NodeId>>>,
 ) {
     use rand::Rng;
     use tokio::io::AsyncWriteExt;
@@ -431,6 +474,16 @@ async fn writer_task(
     let mut last_deliver = Instant::now();
 
     while let Some((sent_at, msg)) = rx.recv().await {
+        // Partition simulation: drop outbound messages to blocked peers.
+        if blocked_peers.read().contains(&peer_id) {
+            continue;
+        }
+
+        // Packet loss simulation: randomly drop messages.
+        if packet_loss > 0.0 && rand::thread_rng().gen::<f64>() < packet_loss {
+            continue;
+        }
+
         // Only sleep when simulated network delay is enabled.  In production
         // (delay == None) skipping the sleep avoids a spurious 1-ms timer
         // wakeup per message (sleep_until(Instant::now()) is never a true
@@ -451,10 +504,14 @@ async fn writer_task(
                 continue;
             }
         };
+        // Combine the 4-byte length header and payload into a single buffer so
+        // the OS emits one sendto() syscall and one TCP segment.  Two separate
+        // write_all() calls doubled the epoll round-trips at the receiver.
         let len = (payload.len() as u32).to_be_bytes();
-        if write_half.write_all(&len).await.is_err()
-            || write_half.write_all(&payload).await.is_err()
-        {
+        let mut frame = Vec::with_capacity(4 + payload.len());
+        frame.extend_from_slice(&len);
+        frame.extend_from_slice(&payload);
+        if write_half.write_all(&frame).await.is_err() {
             break;
         }
     }

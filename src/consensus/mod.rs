@@ -176,6 +176,26 @@ pub struct PubState {
     pub current_term: Term,
     /// True when this node is the leader or knows a live leader.
     pub has_quorum: bool,
+    // ── Extended status (updated on every state change) ──────────────────────
+    /// Highest log index committed by a quorum.
+    pub commit_index: LogIndex,
+    /// Highest log index applied to the local state machine.
+    pub last_applied: LogIndex,
+    /// Number of in-memory log entries (post-compaction).
+    pub log_entries: usize,
+    /// Log index of the most recent snapshot (0 = no snapshot taken yet).
+    pub snapshot_index: LogIndex,
+    /// Human-readable role: "Leader", "Follower", "Candidate", or "".
+    pub role_name: &'static str,
+    /// Number of currently connected peers (all, including observers).
+    pub connected_peers: usize,
+    // ── Monotonic performance counters ─────────────────────────────────────
+    /// Times replicate_to_all() was called (heartbeats + replication rounds).
+    pub heartbeats_sent: u64,
+    /// Total log entries applied to the state machine since startup.
+    pub proposals_committed: u64,
+    /// Elections initiated since startup.
+    pub elections_started: u64,
 }
 
 impl Consensus {
@@ -225,6 +245,9 @@ impl Consensus {
                     max_fs_size,
                     client_pending: HashMap::new(),
                     deferred_responses: HashMap::new(),
+                    heartbeats_sent: 0,
+                    proposals_committed: 0,
+                    elections_started: 0,
                 };
                 tokio::spawn(engine.run(proposal_rx, msg_rx));
 
@@ -328,6 +351,15 @@ impl Consensus {
             ConsensusInner::Totem { pub_state, .. } => pub_state.read().has_quorum,
         }
     }
+
+    /// Return the shared public state snapshot (Raft only; Totem returns a fresh default).
+    /// Callers can clone the Arc to hold a long-lived reference for status display.
+    pub fn pub_state(&self) -> Arc<RwLock<PubState>> {
+        match &*self.inner {
+            ConsensusInner::Raft { pub_state, .. } => pub_state.clone(),
+            ConsensusInner::Totem { .. } => Arc::new(RwLock::new(PubState::default())),
+        }
+    }
 }
 
 // ─── State loader ─────────────────────────────────────────────────────────────
@@ -425,6 +457,10 @@ struct RaftEngine {
     /// corresponding log entry.  Keyed by the log index; entries are fired from
     /// advance_applied() once last_applied reaches the required index.
     deferred_responses: HashMap<LogIndex, Vec<(oneshot::Sender<FileOpResult>, FileOpResult)>>,
+    // ── Performance counters (mirrored into pub_state) ────────────────────
+    heartbeats_sent: u64,
+    proposals_committed: u64,
+    elections_started: u64,
 }
 
 impl RaftEngine {
@@ -913,6 +949,7 @@ impl RaftEngine {
         // Drop forwarded-request callbacks — the follower→leader path is broken.
         // propose() will get Err from done_rx.await and retry.
         self.client_pending.clear();
+        self.elections_started += 1;
 
         self.state.current_term += 1;
         let term = self.state.current_term;
@@ -998,6 +1035,7 @@ impl RaftEngine {
             return;
         }
 
+        self.heartbeats_sent += 1;
         for peer in peers {
             self.send_append_entries_to(peer);
         }
@@ -1253,6 +1291,7 @@ impl RaftEngine {
         // Persist the full filesystem state BEFORE signalling any client.
         // The client only sees "committed" after the data is durable on disk.
         if self.state.last_applied > start_applied {
+            self.proposals_committed += self.state.last_applied - start_applied;
             let snap_term = self.state.log.term_at(self.state.last_applied)
                 .unwrap_or(self.state.log.snapshot_term);
             self.persist_store(self.state.last_applied, snap_term);
@@ -1345,5 +1384,20 @@ impl RaftEngine {
         } else {
             matches!(&self.state.role, Role::Follower { leader: Some(_), .. })
         };
+        // Extended status
+        ps.commit_index = self.state.commit_index;
+        ps.last_applied = self.state.last_applied;
+        ps.log_entries = self.state.log.len();
+        ps.snapshot_index = self.state.log.snapshot_index;
+        ps.role_name = match &self.state.role {
+            Role::Leader { .. } => "Leader",
+            Role::Follower { .. } => "Follower",
+            Role::Candidate { .. } => "Candidate",
+        };
+        ps.connected_peers = self.cluster.peer_count();
+        // Performance counters
+        ps.heartbeats_sent = self.heartbeats_sent;
+        ps.proposals_committed = self.proposals_committed;
+        ps.elections_started = self.elections_started;
     }
 }

@@ -1,14 +1,18 @@
 /// tinycfs cluster pressure-test simulation.
 ///
 /// Spawns N in-process cluster nodes on localhost with configurable artificial
-/// network delay on all inter-node messages. Fires write proposals at a target
-/// requests-per-second rate from random nodes, then reports:
+/// network delay, packet loss, and optional network partition injection.
+/// Fires write proposals at a target requests-per-second rate from random
+/// nodes, then reports:
 ///   - Throughput and success rate
 ///   - Latency percentiles (p50 / p95 / p99)
+///   - Leader election time
 ///   - Consistency check: all stores converge to identical state
 ///
 /// Usage (see CLAUDE.md):
-///   cargo run --bin sim -- --nodes 20 --rps 5000 --delay-min-ms 5 --delay-max-ms 10
+///   cargo run --bin sim -- --nodes 100 --rps 5000 --delay-min-ms 5 --delay-max-ms 10
+///   cargo run --bin sim -- --nodes 20 --partition-at-secs 10 --heal-at-secs 20
+use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -19,11 +23,11 @@ use clap::Parser;
 use parking_lot::RwLock;
 use rand::Rng;
 use tokio::time;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use tinycfs::cluster::{Cluster, ClusterOptions};
-use tinycfs::cluster::message::FileOp;
+use tinycfs::cluster::message::{FileOp, NodeId};
 use tinycfs::config::{Config, ConsensusAlgorithm, NodeConfig};
 use tinycfs::consensus::Consensus;
 use tinycfs::fs::store::FileStore;
@@ -64,6 +68,23 @@ struct Args {
     /// Consensus algorithm: "raft" (default) or "totem".
     #[arg(long, default_value = "raft")]
     algorithm: String,
+
+    /// Drop this percentage of outbound messages to simulate packet loss (0–100).
+    #[arg(long, default_value = "0")]
+    packet_loss_pct: f64,
+
+    /// Inject a network partition at this many seconds after the load test starts.
+    /// The first --partition-size nodes are isolated from the rest.
+    #[arg(long)]
+    partition_at_secs: Option<u64>,
+
+    /// Heal the partition at this many seconds after the load test starts.
+    #[arg(long)]
+    heal_at_secs: Option<u64>,
+
+    /// How many nodes to put in the minority partition (default: half).
+    #[arg(long)]
+    partition_size: Option<usize>,
 }
 
 // ─── Per-node handle ──────────────────────────────────────────────────────────
@@ -144,12 +165,14 @@ async fn main() {
     }
 
     info!(
-        "Simulation: {} nodes, algorithm={:?}, {} rps, delay {}-{} ms, {} s (+{} s warmup)",
+        "Simulation: {} nodes, algorithm={:?}, {} rps, delay {}-{} ms, \
+         packet-loss {:.1}%, duration {} s (+{} s warmup)",
         args.nodes,
         algorithm,
         args.rps,
         args.delay_min_ms,
         args.delay_max_ms,
+        args.packet_loss_pct,
         args.duration_secs,
         args.warmup_secs,
     );
@@ -164,12 +187,23 @@ async fn main() {
         })
         .collect();
 
-    let cluster_opts = ClusterOptions {
-        network_delay: Some((
-            Duration::from_millis(args.delay_min_ms),
-            Duration::from_millis(args.delay_max_ms),
-        )),
-    };
+    // Pre-compute node IDs (used for partition injection).
+    let node_ids: Vec<NodeId> = (0..args.nodes)
+        .map(|i| tinycfs::config::Config::node_id(&format!("sim-{}", i)))
+        .collect();
+
+    // Each node gets its own ClusterOptions with a distinct blocked_peers Arc
+    // so partitions can be injected per-node without affecting siblings.
+    let all_opts: Vec<ClusterOptions> = (0..args.nodes)
+        .map(|_| ClusterOptions {
+            network_delay: Some((
+                Duration::from_millis(args.delay_min_ms),
+                Duration::from_millis(args.delay_max_ms),
+            )),
+            packet_loss: args.packet_loss_pct / 100.0,
+            blocked_peers: Arc::new(RwLock::new(HashSet::new())),
+        })
+        .collect();
 
     // ── Start all nodes ────────────────────────────────────────────────────
     let mut nodes: Vec<SimNode> = Vec::with_capacity(args.nodes);
@@ -191,7 +225,7 @@ async fn main() {
         };
 
         let (cluster_handle, _cluster) =
-            Cluster::start_with_opts(config.clone(), cluster_opts.clone()).await;
+            Cluster::start_with_opts(config.clone(), all_opts[i].clone()).await;
 
         let store = Arc::new(RwLock::new(FileStore::new()));
         let (consensus, msg_tx) = Consensus::new(
@@ -204,7 +238,7 @@ async fn main() {
             0, // no total-fs size limit in simulation
         );
 
-        // Forward inbound cluster messages to the Raft actor.
+        // Forward inbound cluster messages to the consensus actor.
         let rx_in = cluster_handle.rx_in.clone();
         tokio::spawn(async move {
             loop {
@@ -225,18 +259,72 @@ async fn main() {
 
     // ── Wait for leader election ───────────────────────────────────────────
     let warmup = Duration::from_secs(args.warmup_secs);
-    info!("Waiting {}s for cluster to stabilise…", args.warmup_secs);
-    time::sleep(warmup).await;
+    info!("Waiting up to {}s for cluster to stabilise…", args.warmup_secs);
 
-    let leader_found = nodes.iter().any(|n| n.consensus.is_leader());
-    if !leader_found {
-        error!(
-            "No leader elected after {}s — check ports and network settings",
-            args.warmup_secs
-        );
-        std::process::exit(1);
+    let election_timer = Instant::now();
+    let warmup_deadline = time::Instant::now() + warmup;
+    let election_time;
+
+    loop {
+        if nodes.iter().any(|n| n.consensus.is_leader()) {
+            election_time = election_timer.elapsed();
+            info!("Leader elected in {:.0} ms", election_time.as_millis());
+            break;
+        }
+        if time::Instant::now() >= warmup_deadline {
+            eprintln!(
+                "ERROR: No leader elected after {}s — check ports and network settings",
+                args.warmup_secs
+            );
+            std::process::exit(1);
+        }
+        time::sleep(Duration::from_millis(10)).await;
     }
-    info!("Leader elected. Starting load test…");
+
+    // Wait out any remaining warm-up so connections stabilise.
+    let elapsed = election_timer.elapsed();
+    if elapsed < warmup {
+        time::sleep(warmup - elapsed).await;
+    }
+    info!("Cluster stable. Starting load test…");
+
+    // ── Partition injection ────────────────────────────────────────────────
+    let partition_size = args.partition_size.unwrap_or(args.nodes / 2);
+
+    if let Some(at_secs) = args.partition_at_secs {
+        let opts = all_opts.clone();
+        let ids = node_ids.clone();
+        let n = args.nodes;
+        let ps = partition_size;
+        tokio::spawn(async move {
+            time::sleep(Duration::from_secs(at_secs)).await;
+            // Minority: nodes [0..ps] can't talk to majority [ps..n]
+            for i in 0..ps {
+                for j in ps..n {
+                    opts[i].blocked_peers.write().insert(ids[j]);
+                    opts[j].blocked_peers.write().insert(ids[i]);
+                }
+            }
+            warn!(
+                "═══ PARTITION at {}s: nodes 0–{} isolated from {}–{} ═══",
+                at_secs,
+                ps - 1,
+                ps,
+                n - 1
+            );
+        });
+    }
+
+    if let Some(heal_secs) = args.heal_at_secs {
+        let opts = all_opts.clone();
+        tokio::spawn(async move {
+            time::sleep(Duration::from_secs(heal_secs)).await;
+            for opt in &opts {
+                opt.blocked_peers.write().clear();
+            }
+            warn!("═══ PARTITION HEALED at {}s: all nodes communicating ═══", heal_secs);
+        });
+    }
 
     // ── Load test ─────────────────────────────────────────────────────────
     let ok_count = Arc::new(AtomicU64::new(0));
@@ -331,25 +419,36 @@ async fn main() {
     println!("═══════════════════════════════════════════════════════");
     println!(" tinycfs Simulation Results");
     println!("═══════════════════════════════════════════════════════");
-    println!(" Nodes:          {}", args.nodes);
-    println!(" Network delay:  {}–{} ms (one-way)", args.delay_min_ms, args.delay_max_ms);
-    println!(" Target RPS:     {}", args.rps);
-    println!(" Duration:       {:.1} s", total_elapsed.as_secs_f64());
+    println!(" Nodes:           {}", args.nodes);
+    println!(" Algorithm:       {:?}", algorithm);
+    println!(" Network delay:   {}–{} ms (one-way)", args.delay_min_ms, args.delay_max_ms);
+    println!(" Packet loss:     {:.1}%", args.packet_loss_pct);
+    if let Some(at) = args.partition_at_secs {
+        println!(
+            " Partition:       at {}s (size {}), heal {}",
+            at,
+            partition_size,
+            args.heal_at_secs.map(|h| format!("at {}s", h)).unwrap_or_else(|| "never".into()),
+        );
+    }
+    println!(" Target RPS:      {}", args.rps);
+    println!(" Duration:        {:.1} s", total_elapsed.as_secs_f64());
     println!("───────────────────────────────────────────────────────");
-    println!(" Total ops:      {}", total);
-    println!(" Succeeded:      {}  ({:.2}%)", ok, success_pct);
-    println!(" Failed:         {}", err);
-    println!(" Throughput:     {:.0} ops/s", throughput);
+    println!(" Leader elected:  {:.0} ms", election_time.as_millis());
+    println!(" Total ops:       {}", total);
+    println!(" Succeeded:       {}  ({:.2}%)", ok, success_pct);
+    println!(" Failed:          {}", err);
+    println!(" Throughput:      {:.0} ops/s", throughput);
     println!("───────────────────────────────────────────────────────");
-    println!(" Latency p50:    {:.1} ms", hist.percentile(50.0).as_secs_f64() * 1000.0);
-    println!(" Latency p95:    {:.1} ms", hist.percentile(95.0).as_secs_f64() * 1000.0);
-    println!(" Latency p99:    {:.1} ms", hist.percentile(99.0).as_secs_f64() * 1000.0);
-    println!(" Latency mean:   {:.1} ms", hist.mean().as_secs_f64() * 1000.0);
+    println!(" Latency p50:     {:.1} ms", hist.percentile(50.0).as_secs_f64() * 1000.0);
+    println!(" Latency p95:     {:.1} ms", hist.percentile(95.0).as_secs_f64() * 1000.0);
+    println!(" Latency p99:     {:.1} ms", hist.percentile(99.0).as_secs_f64() * 1000.0);
+    println!(" Latency mean:    {:.1} ms", hist.mean().as_secs_f64() * 1000.0);
     println!("───────────────────────────────────────────────────────");
     println!(
-        " Consistency:    {}",
-        if all_same { "PASS - all stores converge to identical state" }
-        else { "FAIL - stores diverged! (possible Raft bug)" }
+        " Consistency:     {}",
+        if all_same { "PASS — all stores converge to identical state" }
+        else { "FAIL — stores diverged! (possible consensus bug)" }
     );
     println!("═══════════════════════════════════════════════════════");
     println!();

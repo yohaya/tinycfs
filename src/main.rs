@@ -15,6 +15,7 @@ use tinycfs::consensus::Consensus;
 use tinycfs::fs::store::FileStore;
 use tinycfs::fs::TinyCfs;
 use tinycfs::persistence::RaftDb;
+use tinycfs::status;
 use tinycfs::syslog_layer::SyslogLayer;
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -92,6 +93,13 @@ struct Args {
 
     #[arg(long, default_value_t = false)]
     no_auto_unmount: bool,
+
+    // ── Runtime status query ───────────────────────────────────────────────
+
+    /// Connect to the running tinycfs instance and print its status, then exit.
+    /// Reads cluster state, filesystem stats, and performance counters in real time.
+    #[arg(long, default_value_t = false)]
+    status: bool,
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -130,6 +138,37 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // ── --status: query the running instance and exit ──────────────────────
+    if args.status {
+        match status::query(&config.local_node).await {
+            Ok(text) => {
+                print!("{}", text);
+                return;
+            }
+            Err(e) => {
+                // Fall back to the periodically-written status file.
+                let path = status::status_file_path(&config.local_node);
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => {
+                        print!("{}", text);
+                        eprintln!("(from cached file — socket unavailable: {})", e);
+                        return;
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "Cannot reach running tinycfs instance: {}\n\
+                             (tried socket {} and file {})",
+                            e,
+                            status::socket_path(&config.local_node),
+                            path
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    }
     info!(
         "Starting tinycfs node '{}' in cluster '{}'",
         config.local_node, config.cluster_name
@@ -176,6 +215,8 @@ async fn main() {
         None
     };
 
+    let started_at = std::time::Instant::now();
+
     // ── Filesystem store ──────────────────────────────────────────────────
     let store: Arc<RwLock<FileStore>> = Arc::new(RwLock::new(FileStore::new()));
 
@@ -188,6 +229,15 @@ async fn main() {
     let (consensus, msg_tx) =
         Consensus::new(config.algorithm.clone(), cluster_handle.clone(), db, store.clone(),
             config.snapshot_every as u64, config.max_file_size_bytes, config.max_fs_size_bytes);
+
+    // ── Status server (Unix socket + periodic file) ───────────────────────
+    status::spawn(
+        config.clone(),
+        cluster_handle.clone(),
+        consensus.pub_state(),
+        store.clone(),
+        started_at,
+    );
 
     // Forward inbound cluster messages to the Raft actor.
     let rx_in = cluster_handle.rx_in.clone();

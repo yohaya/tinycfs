@@ -11,13 +11,20 @@ use crate::cluster::message::Message;
 const MAX_MSG_LEN: u32 = 16 * 1024 * 1024;
 
 /// Encode and send a single message over the stream.
+///
+/// The 4-byte length header and payload are combined into one buffer before
+/// writing.  Two separate write_all() calls would cause the OS to emit two
+/// sendto() syscalls, letting TCP deliver them as two separate segments; the
+/// receiver then needs two epoll_pwait + recvfrom cycles per message instead
+/// of one — a 2× syscall overhead observed in strace on an idle cluster.
 pub async fn send_msg(stream: &mut TcpStream, msg: &Message) -> io::Result<()> {
     let payload = bincode::serialize(msg)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let len = payload.len() as u32;
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(&payload).await?;
-    Ok(())
+    let len = (payload.len() as u32).to_be_bytes();
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&len);
+    frame.extend_from_slice(&payload);
+    stream.write_all(&frame).await
 }
 
 /// Receive a single message from the stream.

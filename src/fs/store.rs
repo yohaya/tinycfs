@@ -110,6 +110,16 @@ impl FileStore {
     }
 
     /// Total bytes of file data currently held across all files.
+    /// Total number of inodes currently in the filesystem (root + all entries).
+    pub fn inode_count(&self) -> usize {
+        self.inodes.len()
+    }
+
+    /// Number of currently held distributed locks.
+    pub fn lock_count(&self) -> usize {
+        self.locks.len()
+    }
+
     pub fn total_data_bytes(&self) -> u64 {
         self.total_data_bytes
     }
