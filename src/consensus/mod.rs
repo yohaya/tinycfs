@@ -769,6 +769,28 @@ impl RaftEngine {
 
         let mut votes = HashSet::new();
         votes.insert(my_id);
+
+        // Single-node cluster: self-vote alone satisfies quorum — become leader
+        // immediately without waiting for peer replies (there are none).
+        let quorum = self.cluster.total_voting_nodes / 2 + 1;
+        if votes.len() >= quorum {
+            info!(
+                "Single-node cluster: self-elected leader for term {} (quorum {})",
+                term, quorum
+            );
+            let last_index = self.state.log.last_index();
+            let peer_ids = self.cluster.peer_ids();
+            self.state.role = Role::Leader {
+                next_index: peer_ids.iter().map(|&id| (id, last_index + 1)).collect(),
+                match_index: peer_ids.iter().map(|&id| (id, 0)).collect(),
+                last_heartbeat: Instant::now() - HEARTBEAT_INTERVAL,
+                last_replicated_index: last_index,
+            };
+            self.update_pub_state();
+            self.replicate_to_all();
+            return;
+        }
+
         self.state.role =
             Role::Candidate { votes, election_deadline: random_deadline() };
         self.update_pub_state();
