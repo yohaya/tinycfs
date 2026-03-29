@@ -388,94 +388,174 @@ impl RaftEngine {
         mut proposal_rx: mpsc::Receiver<Proposal>,
         mut msg_rx: mpsc::Receiver<Envelope>,
     ) {
-        let mut ticker = time::interval(Duration::from_millis(1));
-        ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-
         loop {
+            // Compute the exact instant the next protocol timeout fires.
+            // The task is truly idle between events — no fixed-interval polling.
+            let next_timeout = self.next_deadline();
+
             tokio::select! {
                 biased;
                 Some(env) = msg_rx.recv() => {
                     self.handle_message(env.from, env.msg);
+                    // ClientRequest messages append log entries without replicating
+                    // (to allow batching). Trigger replication now so forwarded
+                    // requests are not delayed until the next heartbeat.
+                    self.replicate_if_new_entries();
                 }
-                _ = ticker.tick() => {
-                    self.tick(&mut proposal_rx).await;
+                _ = time::sleep_until(next_timeout) => {
+                    self.on_deadline(&mut proposal_rx).await;
+                }
+                Some(p) = proposal_rx.recv() => {
+                    self.handle_proposals(p, &mut proposal_rx).await;
                 }
             }
         }
     }
 
-    // ── Tick ──────────────────────────────────────────────────────────────
-
-    async fn tick(&mut self, proposal_rx: &mut mpsc::Receiver<Proposal>) {
+    /// Next instant the engine must wake up even if no messages arrive.
+    fn next_deadline(&self) -> time::Instant {
         let now = Instant::now();
+        let deadline = match &self.state.role {
+            Role::Follower { election_deadline, .. }
+            | Role::Candidate { election_deadline, .. } => *election_deadline,
+            Role::Leader { last_heartbeat, .. } => *last_heartbeat + HEARTBEAT_INTERVAL,
+        };
+        // Convert: compute remaining duration and add to tokio's Instant::now().
+        let remaining = deadline.saturating_duration_since(now);
+        time::Instant::now() + remaining
+    }
 
+    /// Called when the deadline timer fires.
+    async fn on_deadline(&mut self, proposal_rx: &mut mpsc::Receiver<Proposal>) {
+        let now = Instant::now();
         match self.state.role.clone() {
             Role::Follower { election_deadline, leader } => {
                 if now >= election_deadline && !self.cluster.is_observer {
                     self.start_election();
                 } else {
-                    // Forward proposals to the known leader, or drop them so
-                    // propose() retries (it treats a dropped done_tx as signal
-                    // to retry).
-                    loop {
-                        match proposal_rx.try_recv() {
-                            Ok(p) => {
-                                if let Some(leader_id) = leader {
-                                    let req_id = self.state.next_req_id;
-                                    self.state.next_req_id += 1;
-                                    self.client_pending.insert(req_id, p.done);
-                                    self.cluster.send(
-                                        leader_id,
-                                        Message::ClientRequest {
-                                            request_id: req_id,
-                                            op: p.op,
-                                        },
-                                    );
-                                }
-                                // If no leader yet, drop done_tx → propose() retries.
-                            }
-                            Err(_) => break,
-                        }
-                    }
+                    // Deadline fired slightly early (timer jitter). Forward any
+                    // queued proposals to the known leader.
+                    self.forward_or_drop_proposals(leader, proposal_rx);
                 }
             }
             Role::Candidate { election_deadline, .. } => {
                 if now >= election_deadline {
                     self.start_election();
                 }
-                // While a candidate, drain and drop proposals so propose() retries.
                 while proposal_rx.try_recv().is_ok() {}
             }
-            Role::Leader { last_heartbeat, last_replicated_index, .. } => {
-                let mut batch: Vec<Proposal> = Vec::new();
+            Role::Leader { .. } => {
+                // Heartbeat interval elapsed — send heartbeats / replicate.
+                let new_last = self.state.log.last_index();
+                if let Role::Leader {
+                    ref mut last_heartbeat,
+                    ref mut last_replicated_index,
+                    ..
+                } = self.state.role
+                {
+                    *last_heartbeat = now;
+                    *last_replicated_index = new_last;
+                }
+                self.replicate_to_all();
+            }
+        }
+    }
+
+    /// Called when a proposal arrives on the channel. Batches and processes it
+    /// along with any other proposals already queued.
+    async fn handle_proposals(&mut self, first: Proposal, proposal_rx: &mut mpsc::Receiver<Proposal>) {
+        match self.state.role.clone() {
+            Role::Follower { leader, .. } => {
+                // Forward first proposal, then drain the rest.
+                let mut proposals = vec![first];
+                while let Ok(p) = proposal_rx.try_recv() {
+                    proposals.push(p);
+                }
+                self.forward_or_drop_proposals_vec(leader, proposals);
+            }
+            Role::Candidate { .. } => {
+                drop(first);
+                while proposal_rx.try_recv().is_ok() {}
+            }
+            Role::Leader { .. } => {
+                let mut batch = vec![first];
                 while batch.len() < MAX_ENTRIES_PER_RPC {
                     match proposal_rx.try_recv() {
                         Ok(p) => batch.push(p),
                         Err(_) => break,
                     }
                 }
-                let had_proposals = !batch.is_empty();
-                if had_proposals {
-                    self.append_batch(batch);
-                }
-                // Replicate if the HB interval elapsed OR if new entries exist
-                // (e.g. from forwarded ClientRequest messages handled between ticks).
+                self.append_batch(batch);
+                let now = Instant::now();
                 let new_last = self.state.log.last_index();
-                let has_new_entries = new_last > last_replicated_index;
-                if now.duration_since(last_heartbeat) >= HEARTBEAT_INTERVAL || has_new_entries {
-                    if let Role::Leader {
-                        ref mut last_heartbeat,
-                        ref mut last_replicated_index,
-                        ..
-                    } = self.state.role
-                    {
-                        *last_heartbeat = now;
-                        *last_replicated_index = new_last;
-                    }
-                    self.replicate_to_all();
+                if let Role::Leader {
+                    ref mut last_heartbeat,
+                    ref mut last_replicated_index,
+                    ..
+                } = self.state.role
+                {
+                    *last_heartbeat = now;
+                    *last_replicated_index = new_last;
                 }
+                self.replicate_to_all();
             }
         }
+    }
+
+    /// Replicate immediately if there are log entries the leader hasn't sent yet.
+    /// Handles ClientRequest messages forwarded by followers between heartbeats.
+    fn replicate_if_new_entries(&mut self) {
+        if let Role::Leader { last_replicated_index, .. } = self.state.role.clone() {
+            let new_last = self.state.log.last_index();
+            if new_last > last_replicated_index {
+                let now = Instant::now();
+                if let Role::Leader {
+                    ref mut last_heartbeat,
+                    ref mut last_replicated_index,
+                    ..
+                } = self.state.role
+                {
+                    *last_heartbeat = now;
+                    *last_replicated_index = new_last;
+                }
+                self.replicate_to_all();
+            }
+        }
+    }
+
+    fn forward_or_drop_proposals(
+        &mut self,
+        leader: Option<NodeId>,
+        proposal_rx: &mut mpsc::Receiver<Proposal>,
+    ) {
+        loop {
+            match proposal_rx.try_recv() {
+                Ok(p) => self.forward_one_proposal(leader, p),
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn forward_or_drop_proposals_vec(&mut self, leader: Option<NodeId>, proposals: Vec<Proposal>) {
+        for p in proposals {
+            self.forward_one_proposal(leader, p);
+        }
+    }
+
+    fn forward_one_proposal(&mut self, leader: Option<NodeId>, p: Proposal) {
+        if let Some(leader_id) = leader {
+            let req_id = self.state.next_req_id;
+            self.state.next_req_id += 1;
+            self.client_pending.insert(req_id, p.done);
+            self.cluster.send(
+                leader_id,
+                Message::ClientRequest {
+                    request_id: req_id,
+                    op: p.op,
+                },
+            );
+        }
+        // No leader → done_tx drops → propose() retries.
     }
 
     fn append_batch(&mut self, batch: Vec<Proposal>) {

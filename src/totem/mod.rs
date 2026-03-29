@@ -152,6 +152,8 @@ pub struct TotemEngine {
     /// Nodes that have participated in the current join phase.
     join_responders: HashMap<NodeId, ()>,
     join_deadline: Option<Instant>,
+    /// Exponential backoff for repeated failed joins (cluster down).
+    join_retry_backoff: Duration,
 
     // ── Infrastructure
     cluster: ClusterHandle,
@@ -188,6 +190,7 @@ impl TotemEngine {
             join_ring_id: 0,
             join_responders: HashMap::new(),
             join_deadline: None,
+            join_retry_backoff: JOIN_TIMEOUT,
             cluster,
             db,
             store,
@@ -272,6 +275,7 @@ impl TotemEngine {
     // ── Join / ring-reform ────────────────────────────────────────────────────
 
     fn start_join(&mut self, now: Instant) {
+        self.join_retry_backoff = JOIN_TIMEOUT; // reset on organic ring reform
         let new_ring_id = self.join_ring_id.max(self.ring_id) + 1;
         self.join_ring_id = new_ring_id;
         self.join_responders.clear();
@@ -359,11 +363,17 @@ impl TotemEngine {
         let quorum = self.total_voting_nodes / 2 + 1;
 
         if voting_count < quorum {
+            let backoff = self.join_retry_backoff;
+            self.join_retry_backoff = (backoff * 2).min(Duration::from_secs(30));
             warn!(
-                "Totem: join failed — {} voting members agreed, need {}; retrying",
-                voting_count, quorum
+                "Totem: join failed — {} voting members agreed, need {}; retrying in {:?}",
+                voting_count, quorum, backoff
             );
-            self.start_join(now);
+            // Use start_join to broadcast and set up state, then override the
+            // deadline with the backoff duration so we don't hammer the network.
+            self.start_join(now); // also resets join_retry_backoff, but we saved it above
+            self.join_retry_backoff = (backoff * 2).min(Duration::from_secs(30)); // restore
+            self.join_deadline = Some(now + backoff);
             return;
         }
 
