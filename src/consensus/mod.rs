@@ -211,6 +211,7 @@ impl Consensus {
                     store,
                     snapshot_every,
                     client_pending: HashMap::new(),
+                    deferred_responses: HashMap::new(),
                 };
                 tokio::spawn(engine.run(proposal_rx, msg_rx));
 
@@ -375,6 +376,10 @@ struct RaftEngine {
     snapshot_every: u64,
     /// Forwarded-request callbacks: request_id → oneshot reply to local proposer.
     client_pending: HashMap<u64, oneshot::Sender<FileOpResult>>,
+    /// Responses received from the leader before this follower has applied the
+    /// corresponding log entry.  Keyed by the log index; entries are fired from
+    /// advance_applied() once last_applied reaches the required index.
+    deferred_responses: HashMap<LogIndex, Vec<(oneshot::Sender<FileOpResult>, FileOpResult)>>,
 }
 
 impl RaftEngine {
@@ -502,9 +507,20 @@ impl RaftEngine {
             Message::ClientRequest { request_id, op } => {
                 self.on_forwarded_request(from, request_id, op)
             }
-            Message::ClientResponse { request_id, result } => {
+            Message::ClientResponse { request_id, result, log_index } => {
                 if let Some(tx) = self.client_pending.remove(&request_id) {
-                    let _ = tx.send(result);
+                    if self.state.last_applied >= log_index {
+                        // Entry already applied locally — signal the caller now.
+                        let _ = tx.send(result);
+                    } else {
+                        // Entry not yet applied on this follower.  Defer until
+                        // advance_applied() reaches log_index so the caller sees
+                        // the write in the local store when it wakes up.
+                        self.deferred_responses
+                            .entry(log_index)
+                            .or_default()
+                            .push((tx, result));
+                    }
                 }
             }
             _ => {}
@@ -516,6 +532,7 @@ impl RaftEngine {
     fn step_down(&mut self, term: Term, leader: Option<NodeId>) {
         self.state.become_follower(term, leader);
         self.client_pending.clear();
+        self.deferred_responses.clear();
     }
 
     fn on_request_vote(&mut self, from: NodeId, rv: RequestVote) {
@@ -723,6 +740,7 @@ impl RaftEngine {
                 Message::ClientResponse {
                     request_id,
                     result: FileOpResult::Error("not leader".into()),
+                    log_index: 0,
                 },
             );
             return;
@@ -745,7 +763,7 @@ impl RaftEngine {
         tokio::spawn(async move {
             match rx.await {
                 Ok(result) => {
-                    cluster.send(from, Message::ClientResponse { request_id, result });
+                    cluster.send(from, Message::ClientResponse { request_id, result, log_index: idx });
                 }
                 Err(_) => {}
             }
@@ -1104,6 +1122,22 @@ impl RaftEngine {
             let _ = tx.send(result);
         }
 
+        // Fire any follower ClientResponse callbacks that were deferred because
+        // the entry had not yet been applied locally when the response arrived.
+        if !self.deferred_responses.is_empty() {
+            let ready: Vec<LogIndex> = self.deferred_responses.keys()
+                .copied()
+                .filter(|&idx| idx <= self.state.last_applied)
+                .collect();
+            for idx in ready {
+                if let Some(pending) = self.deferred_responses.remove(&idx) {
+                    for (tx, result) in pending {
+                        let _ = tx.send(result);
+                    }
+                }
+            }
+        }
+
         // Compact the in-memory log periodically to bound memory usage.
         if self.state.last_applied >= self.state.next_snapshot_at {
             self.compact_log();
@@ -1155,7 +1189,14 @@ impl RaftEngine {
         ps.is_leader = self.state.is_leader();
         ps.leader_id = self.state.leader_id();
         ps.current_term = self.state.current_term;
-        ps.has_quorum = ps.is_leader
-            || matches!(&self.state.role, Role::Follower { leader: Some(_), .. });
+        ps.has_quorum = if ps.is_leader {
+            // Leader has quorum only if enough voting peers are currently connected.
+            // +1 accounts for the leader itself.
+            let connected_voting = self.cluster.voting_peer_ids().len() + 1;
+            let quorum = self.cluster.total_voting_nodes / 2 + 1;
+            connected_voting >= quorum
+        } else {
+            matches!(&self.state.role, Role::Follower { leader: Some(_), .. })
+        };
     }
 }

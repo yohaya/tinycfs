@@ -287,5 +287,10 @@ pub enum Message {
     ClientResponse {
         request_id: u64,
         result: FileOpResult,
+        /// The Raft log index at which this request was committed.  The
+        /// follower must not signal the local proposer until it has applied
+        /// at least this index, otherwise the file/op is not yet visible in
+        /// the follower's local store and the FUSE handler sees a stale view.
+        log_index: LogIndex,
     },
 }
