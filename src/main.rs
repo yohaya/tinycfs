@@ -256,10 +256,9 @@ async fn main() {
     if nodev {
         fuse_opts.push(fuser::MountOption::NoDev);
     }
-    // relatime is always enabled: update atime only when it is older than mtime/ctime.
-    // This avoids the write-amplification of full noatime while still suppressing
-    // redundant atime writes on repeated reads.
-    fuse_opts.push(fuser::MountOption::CUSTOM("relatime".to_string()));
+    // relatime behaviour is the Linux kernel default (since 2.6.30) and cannot be
+    // passed to fusermount3 as an explicit option — passing it causes an error.
+    // Simply omitting noatime/atime is sufficient; the VFS will apply relatime.
     if args.direct_io {
         fuse_opts.push(fuser::MountOption::CUSTOM("direct_io".to_string()));
     }
