@@ -60,27 +60,6 @@ struct Args {
     #[arg(long, overrides_with = "noexec")]
     exec: bool,
 
-    // ── atime — if neither flag is passed, config value is used ─────────────
-
-    /// Disable access-time updates (overrides config).
-    #[arg(long, overrides_with = "atime")]
-    noatime: bool,
-
-    /// Enable access-time updates (overrides config and --noatime).
-    #[arg(long, overrides_with = "noatime")]
-    atime: bool,
-
-    /// Disable directory access-time updates (overrides config).
-    #[arg(long, overrides_with = "diratime")]
-    nodiratime: bool,
-
-    /// Enable directory access-time updates (overrides config and --nodiratime).
-    #[arg(long, overrides_with = "nodiratime")]
-    diratime: bool,
-
-    #[arg(long, default_value_t = false)]
-    relatime: bool,
-
     // ── Write protection ──────────────────────────────────────────────────
 
     #[arg(long, short = 'r')]
@@ -243,11 +222,9 @@ async fn main() {
 
     // ── Resolve mount flags (CLI explicit > config defaults) ─────────────
     // Flag pairs: if both are false the user didn't pass either → use config.
-    let noexec    = if args.noexec    { true  } else if args.exec      { false } else { config.noexec };
-    let noatime   = if args.noatime   { true  } else if args.atime     { false } else { config.noatime };
-    let nodiratime= if args.nodiratime{ true  } else if args.diratime  { false } else { config.nodiratime };
-    let nosuid    = if args.nosuid    { true  } else if args.suid      { false } else { config.nosuid };
-    let nodev     = if args.nodev     { true  } else if args.dev       { false } else { config.nodev };
+    let noexec = if args.noexec { true } else if args.exec { false } else { config.noexec };
+    let nosuid  = if args.nosuid { true } else if args.suid { false } else { config.nosuid };
+    let nodev   = if args.nodev  { true } else if args.dev  { false } else { config.nodev };
 
     let mut fuse_opts: Vec<fuser::MountOption> = vec![
         fuser::MountOption::FSName("tinycfs".to_string()),
@@ -279,23 +256,18 @@ async fn main() {
     if nodev {
         fuse_opts.push(fuser::MountOption::NoDev);
     }
-    if noatime {
-        fuse_opts.push(fuser::MountOption::NoAtime);
-    }
-    if args.relatime && !noatime {
-        fuse_opts.push(fuser::MountOption::CUSTOM("relatime".to_string()));
-    }
+    // relatime is always enabled: update atime only when it is older than mtime/ctime.
+    // This avoids the write-amplification of full noatime while still suppressing
+    // redundant atime writes on repeated reads.
+    fuse_opts.push(fuser::MountOption::CUSTOM("relatime".to_string()));
     if args.direct_io {
         fuse_opts.push(fuser::MountOption::CUSTOM("direct_io".to_string()));
     }
 
     info!(
-        "Mounting at {:?} [noexec={}, noatime={}, nodiratime={}, nosuid={}, \
-         nodev={}, ro={}, direct_io={}]",
+        "Mounting at {:?} [noexec={}, relatime=true, nosuid={}, nodev={}, ro={}, direct_io={}]",
         mountpoint,
         noexec,
-        noatime,
-        nodiratime,
         nosuid,
         nodev,
         args.read_only,

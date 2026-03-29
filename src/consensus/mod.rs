@@ -827,6 +827,24 @@ impl RaftEngine {
             }
             _ => return,
         };
+
+        if peers.is_empty() {
+            // Single-node cluster: no peers to replicate to, so commit immediately.
+            // In a multi-node cluster the leader waits for peer acknowledgements
+            // (on_append_entries_reply) before advancing commit_index.  With no
+            // peers the quorum is just the leader itself, so every appended entry
+            // is immediately safe to commit.
+            let last_index = self.state.log.last_index();
+            let current_term = self.state.current_term;
+            if last_index > self.state.commit_index
+                && self.state.log.term_at(last_index) == Some(current_term)
+            {
+                self.state.commit_index = last_index;
+                self.advance_applied();
+            }
+            return;
+        }
+
         for peer in peers {
             self.send_append_entries_to(peer);
         }

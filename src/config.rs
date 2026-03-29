@@ -104,12 +104,6 @@ pub struct Config {
     /// Disallow execution of files on the mount. Default: true.
     #[serde(default = "default_true")]
     pub noexec: bool,
-    /// Skip updating access times on reads. Default: true (improves performance).
-    #[serde(default = "default_true")]
-    pub noatime: bool,
-    /// Skip updating directory access times on reads. Default: true.
-    #[serde(default = "default_true")]
-    pub nodiratime: bool,
     /// Disallow setuid/setgid execution. Default: true (security hardening).
     #[serde(default = "default_true")]
     pub nosuid: bool,

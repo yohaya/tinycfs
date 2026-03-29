@@ -185,8 +185,6 @@ async fn main() {
             snapshot_every: 50_000,
             mountpoint: None,
             noexec: true,
-            noatime: true,
-            nodiratime: true,
             nosuid: true,
             nodev: true,
             nodes: node_configs.clone(),

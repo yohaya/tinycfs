@@ -209,7 +209,11 @@
   // ── Default FUSE mount options ────────────────────────────────────────────
   //
   // These control how the kernel treats the mounted filesystem.  CLI flags
-  // (--noexec, --exec, --noatime, etc.) take precedence over these values.
+  // (--noexec, --exec, etc.) take precedence over these values.
+  //
+  // relatime is always enabled unconditionally: the kernel updates atime only
+  // when it is older than mtime/ctime, eliminating redundant atime writes on
+  // repeated reads without fully disabling atime (required by some tools).
   //
   // All of these default to true as appropriate safe defaults for a shared
   // configuration filesystem.
@@ -221,20 +225,6 @@
   //              Setting false is a security risk: any node can place a binary
   //              that every cluster member might run.
   noexec: true,
-
-  // noatime  (optional — default: true)
-  //
-  // Skip updating the access-time (atime) inode field on reads.
-  // Recommended: true — eliminates write amplification from read-heavy workloads.
-  //              Each atime update would generate a Raft log entry replicated
-  //              to every node.  With atime disabled, reads are zero-overhead.
-  noatime: true,
-
-  // nodiratime  (optional — default: true)
-  //
-  // Same as noatime but specifically for directory access times.
-  // Recommended: true — same reasoning as noatime.
-  nodiratime: true,
 
   // nosuid  (optional — default: true)
   //
@@ -322,8 +312,6 @@
 //  snapshot_every        integer  10000      no         100 – 1000000
 //  mountpoint            string   null       no         FUSE mount directory path
 //  noexec                bool     true       no         disallow execution on mount
-//  noatime               bool     true       no         skip atime updates on reads
-//  nodiratime            bool     true       no         skip dir atime updates
 //  nosuid                bool     true       no         disallow setuid/setgid
 //  nodev                 bool     true       no         disallow device files
 //  nodes[].name          string   —          YES        unique, stable identifier

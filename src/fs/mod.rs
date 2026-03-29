@@ -11,6 +11,7 @@ use fuser::{
 use parking_lot::RwLock;
 use std::sync::Arc;
 use tokio::runtime::Handle;
+use tracing::warn;
 
 use crate::cluster::message::FileOp;
 use crate::consensus::Consensus;
@@ -227,12 +228,15 @@ impl Filesystem for TinyCfs {
             reply.error(libc::ENOSPC);
             return;
         }
-        let op = FileOp::Write { path, offset: offset as u64, data: data.to_vec() };
+        let op = FileOp::Write { path: path.clone(), offset: offset as u64, data: data.to_vec() };
         let consensus = self.consensus.clone();
         let data_len = data.len();
         match self.handle.block_on(consensus.propose(op)) {
             Ok(()) => reply.written(data_len as u32),
-            Err(e) => reply.error(to_errno(&e)),
+            Err(e) => {
+                warn!("FUSE write failed for {:?} at offset {}: {}", path, offset, e);
+                reply.error(to_errno(&e));
+            }
         }
     }
 
@@ -289,7 +293,10 @@ impl Filesystem for TinyCfs {
                     None => reply.error(libc::ENOENT),
                 }
             }
-            Err(e) => reply.error(to_errno(&e)),
+            Err(e) => {
+                warn!("FUSE setattr failed for ino {}: {}", ino, e);
+                reply.error(to_errno(&e));
+            }
         }
     }
 
@@ -300,13 +307,17 @@ impl Filesystem for TinyCfs {
         name: &OsStr,
         mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
         if !self.cluster_writeable() {
             reply.error(libc::EROFS);
             return;
         }
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => { reply.error(libc::EINVAL); return; }
+        };
         let path = match self.path_for(parent, name) {
             Some(p) => p,
             None => {
@@ -314,18 +325,61 @@ impl Filesystem for TinyCfs {
                 return;
             }
         };
-        let op = FileOp::CreateFile { path, mode: mode & 0o7777, uid: req.uid(), gid: req.gid() };
+
+        // If the file already exists in our store, handle O_EXCL / open-existing
+        // without a Raft round-trip (creating a new log entry for an already-existing
+        // file would fail with AlreadyExists once applied, returning EIO to the caller).
+        {
+            let store = self.store.read();
+            if let Some(ino) = store.lookup(parent, name_str) {
+                if flags & libc::O_EXCL != 0 {
+                    reply.error(libc::EEXIST);
+                    return;
+                }
+                // File exists and O_EXCL not set: open it (truncation handled below).
+                if let Some(inode) = store.get(ino) {
+                    // If O_TRUNC is set, propose a truncate through consensus so all nodes
+                    // see the truncation; otherwise just return the existing attrs.
+                    if flags & libc::O_TRUNC != 0 {
+                        let truncate_path = path.clone();
+                        drop(store);
+                        let consensus = self.consensus.clone();
+                        let op = FileOp::Truncate { path: truncate_path, size: 0 };
+                        if let Err(e) = self.handle.block_on(consensus.propose(op)) {
+                            warn!("FUSE create O_TRUNC failed for {:?}: {}", path, e);
+                            reply.error(to_errno(&e));
+                            return;
+                        }
+                        let store = self.store.read();
+                        match store.get(ino) {
+                            Some(inode) => { reply.created(&TTL, &to_fuser_attr(inode), 0, 0, 0); }
+                            None => { reply.error(libc::ENOENT); }
+                        }
+                    } else {
+                        reply.created(&TTL, &to_fuser_attr(inode), 0, 0, 0);
+                    }
+                    return;
+                }
+            }
+        }
+
+        let op = FileOp::CreateFile { path: path.clone(), mode: mode & 0o7777, uid: req.uid(), gid: req.gid() };
         let consensus = self.consensus.clone();
         match self.handle.block_on(consensus.propose(op)) {
             Ok(()) => {
-                let name_str = name.to_str().unwrap_or("");
                 let store = self.store.read();
                 match store.lookup(parent, name_str).and_then(|ino| store.get(ino)) {
                     Some(inode) => reply.created(&TTL, &to_fuser_attr(inode), 0, 0, 0),
-                    None => reply.error(libc::ENOENT),
+                    None => {
+                        warn!("FUSE create: file {:?} not in store after successful propose", path);
+                        reply.error(libc::ENOENT);
+                    }
                 }
             }
-            Err(e) => reply.error(to_errno(&e)),
+            Err(e) => {
+                warn!("FUSE create failed for {:?}: {}", path, e);
+                reply.error(to_errno(&e));
+            }
         }
     }
 
