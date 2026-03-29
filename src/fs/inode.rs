@@ -150,7 +150,11 @@ pub fn to_fuser_attr(inode: &Inode) -> fuser::FileAttr {
         uid: m.uid,
         gid: m.gid,
         rdev: 0,
-        blksize: 4096,
+        // 128 KiB preferred I/O size: tools like cp/rsync use st_blksize to
+        // size their read/write buffers.  At 4 KiB each write was a separate
+        // Raft round-trip (~400 KB/s at 5 ms RTT); at 128 KiB we get 32x
+        // fewer proposals per MB → ~12.8 MB/s on the same link.
+        blksize: 128 * 1024,
         flags: 0,
     }
 }

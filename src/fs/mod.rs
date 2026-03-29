@@ -119,7 +119,11 @@ impl TinyCfs {
 const TTL: Duration = Duration::from_secs(1);
 
 impl Filesystem for TinyCfs {
-    fn init(&mut self, _req: &Request<'_>, _config: &mut KernelConfig) -> Result<(), libc::c_int> {
+    fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), libc::c_int> {
+        // Allow the kernel to send writes up to 4 MiB in a single FUSE call.
+        // Fuser defaults to its MAX_WRITE_SIZE (16 MiB) but being explicit
+        // here documents the choice and aligns with blksize below.
+        let _ = config.set_max_write(4 * 1024 * 1024);
         Ok(())
     }
 
@@ -567,8 +571,10 @@ impl Filesystem for TinyCfs {
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
+        // bsize / frsize = 128 KiB: matches blksize in FileAttr so that df,
+        // cp and other tools that inspect f_bsize use the same I/O unit.
         reply.statfs(
-            1_000_000, 900_000, 900_000, 1_000_000, 999_000, 4096, 255, 4096,
+            1_000_000, 900_000, 900_000, 1_000_000, 999_000, 128 * 1024, 255, 128 * 1024,
         );
     }
 
