@@ -5,7 +5,7 @@
 /// Writes are proposed to Raft and applied here once committed.
 ///
 /// Serializable via serde/bincode for Raft snapshots.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,13 @@ pub struct FileStore {
     max_file_size_bytes: u64,
     #[serde(skip, default)]
     max_fs_size_bytes: u64,
+    // ── Dirty tracking for per-inode delta persistence ────────────────────
+    // Populated by every mutator; drained by persist_store in the Raft actor.
+    // Not serialized — rebuilt from applied ops, never snapshotted.
+    #[serde(skip, default)]
+    dirty_inodes: HashSet<Ino>,
+    #[serde(skip, default)]
+    deleted_inodes: HashSet<Ino>,
 }
 
 impl FileStore {
@@ -79,6 +86,9 @@ impl FileStore {
             ctime: SystemTime::now(),
         };
         inodes.insert(ROOT_INO, Inode::Dir(DirInode { meta: root_meta, parent_ino: ROOT_INO, entries: HashMap::new() }));
+        // Mark the root inode dirty so it is persisted on the first commit.
+        let mut dirty_inodes = HashSet::new();
+        dirty_inodes.insert(ROOT_INO);
         FileStore {
             inodes,
             next_ino: 2,
@@ -86,6 +96,23 @@ impl FileStore {
             total_data_bytes: 0,
             max_file_size_bytes: 0,
             max_fs_size_bytes: 0,
+            dirty_inodes,
+            deleted_inodes: HashSet::new(),
+        }
+    }
+
+    /// Reconstruct a FileStore from persisted inode data (loaded from SQLite).
+    /// `dirty_inodes` starts empty — nothing needs to be re-persisted.
+    pub fn from_parts(inodes: HashMap<Ino, Inode>, next_ino: Ino, total_data_bytes: u64) -> Self {
+        FileStore {
+            inodes,
+            next_ino,
+            locks: HashMap::new(),
+            total_data_bytes,
+            max_file_size_bytes: 0,
+            max_fs_size_bytes: 0,
+            dirty_inodes: HashSet::new(),
+            deleted_inodes: HashSet::new(),
         }
     }
 
@@ -130,6 +157,25 @@ impl FileStore {
     pub fn set_limits(&mut self, max_file_size: u64, max_fs_size: u64) {
         self.max_file_size_bytes = max_file_size;
         self.max_fs_size_bytes = max_fs_size;
+    }
+
+    /// Current value of the inode allocator (needed by the persist layer).
+    pub fn next_ino_val(&self) -> Ino { self.next_ino }
+
+    /// All inodes — used when serialising a full snapshot for InstallSnapshot.
+    pub fn inodes(&self) -> &HashMap<Ino, Inode> { &self.inodes }
+
+    /// Drain the dirty-inode sets accumulated since the last persist call.
+    ///
+    /// Returns `(dirty_set, deleted_set)` where `dirty_set` holds ino numbers
+    /// of inodes that were created or modified, and `deleted_set` holds ino
+    /// numbers of inodes that were removed.  Callers look up and serialise each
+    /// dirty inode before passing it to the persistence layer.
+    pub fn drain_dirty(&mut self) -> (HashSet<Ino>, HashSet<Ino>) {
+        (
+            std::mem::take(&mut self.dirty_inodes),
+            std::mem::take(&mut self.deleted_inodes),
+        )
     }
 
     pub fn readdir(&self, ino: Ino) -> Result<Vec<(String, Ino, InoKind)>> {
@@ -293,6 +339,8 @@ impl FileStore {
             dir.entries.insert(name.to_string(), ino);
             dir.meta.mtime = SystemTime::now();
         }
+        self.dirty_inodes.insert(ino);
+        self.dirty_inodes.insert(parent_ino);
         Ok(())
     }
 
@@ -316,6 +364,8 @@ impl FileStore {
             dir.meta.mtime = SystemTime::now();
             dir.meta.nlink += 1;
         }
+        self.dirty_inodes.insert(ino);
+        self.dirty_inodes.insert(parent_ino);
         Ok(())
     }
 
@@ -331,6 +381,8 @@ impl FileStore {
             dir.entries.insert(name.to_string(), ino);
             dir.meta.mtime = SystemTime::now();
         }
+        self.dirty_inodes.insert(ino);
+        self.dirty_inodes.insert(parent_ino);
         Ok(())
     }
 
@@ -368,6 +420,7 @@ impl FileStore {
                 let new_size = f.data.len() as u64;
                 self.total_data_bytes =
                     self.total_data_bytes.saturating_add(new_size).saturating_sub(old_size);
+                self.dirty_inodes.insert(ino);
                 Ok(())
             }
             Some(_) => Err(TinyCfsError::IsDirectory),
@@ -396,6 +449,7 @@ impl FileStore {
                 f.meta.mtime = SystemTime::now();
                 self.total_data_bytes =
                     self.total_data_bytes.saturating_add(size).saturating_sub(old_size);
+                self.dirty_inodes.insert(ino);
                 Ok(())
             }
             Some(_) => Err(TinyCfsError::IsDirectory),
@@ -419,6 +473,9 @@ impl FileStore {
             dir.meta.mtime = SystemTime::now();
         }
         self.inodes.remove(&child_ino);
+        self.dirty_inodes.remove(&child_ino);   // no longer exists
+        self.deleted_inodes.insert(child_ino);
+        self.dirty_inodes.insert(parent_ino);
         Ok(())
     }
 
@@ -439,6 +496,9 @@ impl FileStore {
             dir.meta.nlink -= 1;
         }
         self.inodes.remove(&child_ino);
+        self.dirty_inodes.remove(&child_ino);
+        self.deleted_inodes.insert(child_ino);
+        self.dirty_inodes.insert(parent_ino);
         Ok(())
     }
 
@@ -450,6 +510,8 @@ impl FileStore {
             .ok_or_else(|| TinyCfsError::NotFound(from_name.to_string()))?;
         if let Some(old_ino) = self.lookup(to_parent, to_name) {
             self.inodes.remove(&old_ino);
+            self.dirty_inodes.remove(&old_ino);
+            self.deleted_inodes.insert(old_ino);
         }
         if let Some(Inode::Dir(dir)) = self.inodes.get_mut(&from_parent) {
             dir.entries.remove(from_name);
@@ -465,6 +527,9 @@ impl FileStore {
                 child_dir.parent_ino = to_parent;
             }
         }
+        self.dirty_inodes.insert(child_ino);
+        self.dirty_inodes.insert(from_parent);
+        self.dirty_inodes.insert(to_parent);
         Ok(())
     }
 
@@ -501,6 +566,7 @@ impl FileStore {
                 m.atime = UNIX_EPOCH + Duration::from_secs(v);
             }
             m.ctime = now;
+            self.dirty_inodes.insert(ino);
         }
         Ok(())
     }

@@ -1,20 +1,26 @@
 //! SQLite-backed persistence for tinycfs.
 //!
-//! Only two things are written to disk:
+//! Two things are written to disk:
 //!
-//!   1. **Raft metadata** (`current_term`, `voted_for`) — the only Raft state
-//!      that MUST survive a crash for safety.  Without it a node could vote
-//!      twice in the same term (voted_for) or accept a stale leader (term).
+//!   1. **Raft metadata** (`current_term`, `voted_for`) — must survive a crash
+//!      for Raft safety (prevents double-voting / accepting a stale leader).
 //!
-//!   2. **FileStore snapshot** — a serialized copy of the in-memory filesystem
-//!      taken every `snapshot_every` applied entries.  On restart the node
-//!      loads this snapshot and re-syncs any entries committed since the
-//!      snapshot from the Raft leader, just like pmxcfs syncs from peers.
+//!   2. **FileStore state** — stored as *one row per inode* in `fs_inodes`,
+//!      not as a single serialised blob.  On each committed batch only the
+//!      inodes that actually changed are written: O(changed_files_in_batch)
+//!      instead of O(total_filesystem_size).  With `persist_every=1` (the
+//!      default) every write is immediately durable at O(1) cost regardless
+//!      of how many other files exist.
 //!
-//! The Raft log is intentionally kept in memory only.  After a crash the
-//! node starts from the last snapshot (or empty if none) and the leader
-//! re-sends any missing entries via AppendEntries / InstallSnapshot.
-//! Safety holds because committed entries always exist on a majority of nodes.
+//!      The old `fs_snapshot` blob table is retained for two purposes:
+//!        - receiving `InstallSnapshot` from a leader (full state transfer)
+//!        - reading databases written by an older version of tinycfs
+//!
+//! On restart:
+//!   1. Load all rows from `fs_inodes` → rebuild the in-memory FileStore.
+//!   2. Load `snapshot_index` from `fs_meta` → tell the Raft log where the
+//!      persisted state is anchored.
+//!   3. Ask the leader for any entries committed after `snapshot_index`.
 
 use rusqlite::{params, Connection};
 use std::path::Path;
@@ -45,6 +51,20 @@ impl RaftDb {
                  value INTEGER NOT NULL
              ) WITHOUT ROWID;
 
+             -- Per-inode table: one row per inode, bincode-encoded Inode struct.
+             -- Replaces the old single-blob fs_snapshot for normal write path.
+             CREATE TABLE IF NOT EXISTS fs_inodes (
+                 ino  INTEGER PRIMARY KEY,
+                 data BLOB NOT NULL
+             );
+
+             -- FileStore bookkeeping: next_ino, total_bytes, snapshot_index, snapshot_term.
+             CREATE TABLE IF NOT EXISTS fs_meta (
+                 key   TEXT PRIMARY KEY,
+                 value INTEGER NOT NULL
+             ) WITHOUT ROWID;
+
+             -- Legacy blob snapshot: used for InstallSnapshot and backwards-compat reads.
              CREATE TABLE IF NOT EXISTS fs_snapshot (
                  id             INTEGER PRIMARY KEY CHECK (id = 1),
                  snapshot_index INTEGER NOT NULL,
@@ -60,11 +80,6 @@ impl RaftDb {
     // ── Raft metadata ─────────────────────────────────────────────────────────
 
     /// Persist current_term and voted_for atomically.
-    ///
-    /// Both values are written inside a single SQLite transaction.  Without
-    /// a transaction a crash between the two writes can leave `term` advanced
-    /// while `voted_for` is stale (or absent), which would let the node vote
-    /// twice in the same term after restart — a Raft safety violation.
     pub fn save_term(&mut self, term: Term, voted_for: Option<NodeId>) -> Result<()> {
         let tx = self.conn
             .transaction()
@@ -115,9 +130,150 @@ impl RaftDb {
         Ok((term, voted_for))
     }
 
-    // ── FileStore snapshot ────────────────────────────────────────────────────
+    // ── Per-inode delta persistence ───────────────────────────────────────────
 
-    /// Persist a FileStore snapshot (only the latest is kept).
+    /// Write the delta from a committed Raft batch to SQLite in one transaction.
+    ///
+    /// `dirty` — (ino, bincode-serialized Inode) for every inode created or
+    ///           modified in the batch.
+    /// `deleted` — inode numbers that were removed from the filesystem.
+    ///
+    /// `snap_index` / `snap_term` are always written to `fs_meta` so that on
+    /// restart the engine knows where in the Raft log the on-disk state is
+    /// anchored (even when dirty and deleted are both empty, e.g. after a log
+    /// compaction whose data was already persisted by a prior call).
+    pub fn apply_inode_delta(
+        &mut self,
+        dirty:       &[(u64, Vec<u8>)],  // (ino, bincode-encoded Inode)
+        deleted:     &[u64],             // ino numbers to remove
+        next_ino:    u64,
+        total_bytes: u64,
+        snap_index:  LogIndex,
+        snap_term:   Term,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()
+            .map_err(|e| TinyCfsError::Io(e.to_string()))?;
+
+        for (ino, data) in dirty {
+            tx.execute(
+                "INSERT OR REPLACE INTO fs_inodes (ino, data) VALUES (?1, ?2)",
+                params![*ino as i64, data],
+            ).map_err(|e| TinyCfsError::Io(e.to_string()))?;
+        }
+        for ino in deleted {
+            tx.execute(
+                "DELETE FROM fs_inodes WHERE ino = ?1",
+                params![*ino as i64],
+            ).map_err(|e| TinyCfsError::Io(e.to_string()))?;
+        }
+
+        for (key, val) in &[
+            ("next_ino",       next_ino),
+            ("total_bytes",    total_bytes),
+            ("snapshot_index", snap_index),
+            ("snapshot_term",  snap_term),
+        ] {
+            tx.execute(
+                "INSERT OR REPLACE INTO fs_meta (key, value) VALUES (?1, ?2)",
+                params![key, *val as i64],
+            ).map_err(|e| TinyCfsError::Io(e.to_string()))?;
+        }
+
+        tx.commit().map_err(|e| TinyCfsError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Atomically replace the entire `fs_inodes` table with the given set.
+    ///
+    /// Called when the node receives an InstallSnapshot from the leader.
+    /// Clears the old table and writes the full snapshot in one transaction
+    /// so the on-disk state is never partially applied.
+    pub fn apply_full_inode_snapshot(
+        &mut self,
+        inodes:      &[(u64, Vec<u8>)],  // (ino, bincode-encoded Inode)
+        next_ino:    u64,
+        total_bytes: u64,
+        snap_index:  LogIndex,
+        snap_term:   Term,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()
+            .map_err(|e| TinyCfsError::Io(e.to_string()))?;
+
+        tx.execute("DELETE FROM fs_inodes", [])
+            .map_err(|e| TinyCfsError::Io(e.to_string()))?;
+
+        for (ino, data) in inodes {
+            tx.execute(
+                "INSERT INTO fs_inodes (ino, data) VALUES (?1, ?2)",
+                params![*ino as i64, data],
+            ).map_err(|e| TinyCfsError::Io(e.to_string()))?;
+        }
+
+        for (key, val) in &[
+            ("next_ino",       next_ino),
+            ("total_bytes",    total_bytes),
+            ("snapshot_index", snap_index),
+            ("snapshot_term",  snap_term),
+        ] {
+            tx.execute(
+                "INSERT OR REPLACE INTO fs_meta (key, value) VALUES (?1, ?2)",
+                params![key, *val as i64],
+            ).map_err(|e| TinyCfsError::Io(e.to_string()))?;
+        }
+
+        tx.commit().map_err(|e| TinyCfsError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load persisted filesystem state from the per-inode table.
+    ///
+    /// Returns `None` when `fs_inodes` is empty — either first boot or a node
+    /// that only has the legacy blob snapshot (see `load_snapshot`).
+    pub fn load_fs_state(
+        &self,
+    ) -> Result<Option<(Vec<(u64, Vec<u8>)>, u64, u64, LogIndex, Term)>> {
+        let count: i64 = self.conn
+            .query_row("SELECT COUNT(*) FROM fs_inodes", [], |r| r.get(0))
+            .map_err(|e| TinyCfsError::Io(e.to_string()))?;
+        if count == 0 {
+            return Ok(None);
+        }
+
+        let mut stmt = self.conn
+            .prepare("SELECT ino, data FROM fs_inodes")
+            .map_err(|e| TinyCfsError::Io(e.to_string()))?;
+
+        let inodes: Vec<(u64, Vec<u8>)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|e| TinyCfsError::Io(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let get_meta = |key: &str| -> u64 {
+            self.conn
+                .query_row(
+                    "SELECT value FROM fs_meta WHERE key = ?1",
+                    params![key],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|v| v as u64)
+                .unwrap_or(0)
+        };
+
+        Ok(Some((
+            inodes,
+            get_meta("next_ino"),
+            get_meta("total_bytes"),
+            get_meta("snapshot_index"),
+            get_meta("snapshot_term"),
+        )))
+    }
+
+    // ── Legacy blob snapshot (InstallSnapshot + backwards compat) ─────────────
+
+    /// Persist a full FileStore snapshot blob (used for InstallSnapshot).
     pub fn save_snapshot(&self, index: LogIndex, term: Term, data: &[u8]) -> Result<()> {
         self.conn
             .execute(
@@ -129,7 +285,7 @@ impl RaftDb {
         Ok(())
     }
 
-    /// Load the most recent snapshot, if any.
+    /// Load the most recent blob snapshot, if any.
     pub fn load_snapshot(&self) -> Result<Option<(LogIndex, Term, Vec<u8>)>> {
         let result = self.conn.query_row(
             "SELECT snapshot_index, snapshot_term, data FROM fs_snapshot WHERE id = 1",

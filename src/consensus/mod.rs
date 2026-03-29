@@ -380,36 +380,48 @@ fn load_state_from_db(db: &RaftDb, store: &Arc<RwLock<FileStore>>, snapshot_ever
         )
     });
 
-    // Load the last saved FileStore snapshot.  The Raft log is NOT persisted —
-    // any entries committed after the snapshot will be re-sent by the leader
-    // once this node rejoins the cluster.
-    let (snapshot_index, snapshot_term) = match db.load_snapshot() {
-        Ok(Some((si, st, data))) => {
-            match bincode::deserialize::<FileStore>(&data) {
-                Ok(snap_store) => {
-                    *store.write() = snap_store;
-                    info!("Loaded snapshot at index {} (term {})", si, st);
-                    (si, st)
+    // Load persisted filesystem state.  Try the new per-inode table first;
+    // fall back to the legacy blob snapshot for databases written by older
+    // versions or populated via InstallSnapshot before the first delta persist.
+    let (snapshot_index, snapshot_term) = match db.load_fs_state() {
+        Ok(Some((inode_rows, next_ino, total_bytes, si, st))) => {
+            let inodes: std::collections::HashMap<crate::fs::inode::Ino, crate::fs::inode::Inode> =
+                inode_rows.into_iter()
+                    .filter_map(|(ino, data)| {
+                        bincode::deserialize::<crate::fs::inode::Inode>(&data)
+                            .ok()
+                            .map(|inode| (ino, inode))
+                    })
+                    .collect();
+            let loaded = FileStore::from_parts(inodes, next_ino, total_bytes);
+            *store.write() = loaded;
+            info!("Loaded per-inode state at index {} (term {})", si, st);
+            (si, st)
+        }
+        Ok(None) => {
+            // Fall back to legacy full-blob snapshot (older DB or post-InstallSnapshot).
+            match db.load_snapshot() {
+                Ok(Some((si, st, data))) => {
+                    match bincode::deserialize::<FileStore>(&data) {
+                        Ok(snap_store) => {
+                            *store.write() = snap_store;
+                            info!("Loaded legacy snapshot at index {} (term {})", si, st);
+                            (si, st)
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to deserialize snapshot at index {} — treating as absent: {}",
+                                si, e
+                            );
+                            (0, 0)
+                        }
+                    }
                 }
-                Err(e) => {
-                    // Corrupt snapshot: reset to empty rather than anchoring the
-                    // log at (si, st) with an empty store.  Anchoring would apply
-                    // all subsequent entries on a blank state machine, silently
-                    // corrupting every committed file.  Starting from (0, 0) forces
-                    // the leader to re-sync the full history instead.
-                    warn!(
-                        "Failed to deserialize snapshot at index {} — treating as absent: {}",
-                        si, e
-                    );
-                    (0, 0)
-                }
+                Ok(None) => (0, 0),
+                Err(e) => { warn!("Failed to load snapshot: {}", e); (0, 0) }
             }
         }
-        Ok(None) => (0, 0),
-        Err(e) => {
-            warn!("Failed to load snapshot: {}", e);
-            (0, 0)
-        }
+        Err(e) => { warn!("Failed to load fs state: {}", e); (0, 0) }
     };
 
     // Start with an empty in-memory log anchored at the snapshot boundary.
@@ -1175,30 +1187,56 @@ impl RaftEngine {
             return;
         }
 
-        // Persist to DB BEFORE updating in-memory state.  If we updated memory
-        // first and then the DB write failed, a subsequent restart would load the
-        // old (pre-snapshot) state and re-apply entries on stale data.  Writing
-        // to DB first ensures that on any failure we can safely retry.
-        if let Some(db) = &mut self.db {
-            if let Err(e) = db.save_snapshot(is.snapshot_index, is.snapshot_term, &is.data) {
-                warn!("InstallSnapshot: DB save failed, ignoring snapshot: {}", e);
-                // Do not update in-memory state; the leader will retry.
+        // Deserialize the snapshot first so we can write both storage formats
+        // atomically before updating in-memory state.
+        let snap_store = match bincode::deserialize::<crate::fs::store::FileStore>(&is.data) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("InstallSnapshot: deserialize failed from {}: {}", from, e);
                 return;
+            }
+        };
+
+        // Persist to DB BEFORE updating in-memory state.
+        // Write both the legacy blob (for backwards compat) and the per-inode
+        // table so the node can use the fast delta path after this snapshot.
+        if let Some(db) = &mut self.db {
+            // Legacy blob — keeps the fs_snapshot table consistent.
+            if let Err(e) = db.save_snapshot(is.snapshot_index, is.snapshot_term, &is.data) {
+                warn!("InstallSnapshot: blob DB save failed, ignoring snapshot: {}", e);
+                return;
+            }
+            // Per-inode table — atomically replaces all rows.
+            let inodes: Vec<(u64, Vec<u8>)> = snap_store.inodes().iter()
+                .filter_map(|(ino, inode)| {
+                    bincode::serialize(inode).ok().map(|d| (*ino, d))
+                })
+                .collect();
+            if let Err(e) = db.apply_full_inode_snapshot(
+                &inodes,
+                snap_store.next_ino_val(),
+                snap_store.total_data_bytes(),
+                is.snapshot_index,
+                is.snapshot_term,
+            ) {
+                warn!("InstallSnapshot: per-inode DB save failed (non-fatal): {}", e);
+                // Non-fatal: blob snapshot was saved; delta path will catch up.
             }
         }
 
-        // Apply the snapshot to the state machine.
-        match bincode::deserialize::<crate::fs::store::FileStore>(&is.data) {
-            Ok(snap_store) => {
-                let mut st = self.store.write();
-                *st = snap_store;
-                // serde(skip) fields are reset to 0 by deserialization;
-                // re-apply the configured size limits.
-                st.set_limits(self.max_file_size, self.max_fs_size);
-            }
-            Err(e) => {
-                warn!("InstallSnapshot deserialize failed: {}", e);
-                return;
+        // Apply the snapshot to the state machine (reuse the already-deserialized store).
+        {
+            let mut st = self.store.write();
+            // Re-deserialize into the store to avoid partially moving snap_store above.
+            match bincode::deserialize::<crate::fs::store::FileStore>(&is.data) {
+                Ok(s) => {
+                    *st = s;
+                    st.set_limits(self.max_file_size, self.max_fs_size);
+                }
+                Err(e) => {
+                    warn!("InstallSnapshot: in-memory apply failed: {}", e);
+                    return;
+                }
             }
         }
 
@@ -1348,21 +1386,40 @@ impl RaftEngine {
     }
 
     /// Serialize the FileStore and write it to SQLite as the current snapshot.
-    fn persist_store(&self, snap_index: LogIndex, snap_term: Term) {
-        if let Some(db) = &self.db {
-            let data = {
-                let st = self.store.read();
-                match bincode::serialize(&*st) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        warn!("FileStore serialization failed at index {}: {}", snap_index, e);
-                        return;
-                    }
-                }
-            };
-            if let Err(e) = db.save_snapshot(snap_index, snap_term, &data) {
-                warn!("FileStore persist failed at index {}: {}", snap_index, e);
-            }
+    /// Persist changed inodes to SQLite as a delta (O(changed_files), not O(total_files)).
+    ///
+    /// Drains the dirty/deleted sets from the FileStore, serialises only the
+    /// modified inodes, and writes them in a single SQLite transaction along
+    /// with the updated bookkeeping values.  The `snap_index` / `snap_term`
+    /// are always written so the restart logic knows where in the Raft log the
+    /// on-disk state is anchored — even when the dirty sets happen to be empty
+    /// (e.g. compact_log calling after a batch that was already persisted).
+    fn persist_store(&mut self, snap_index: LogIndex, snap_term: Term) {
+        let db = match &mut self.db { Some(d) => d, None => return };
+
+        // Drain dirty sets (brief write lock — just swaps two HashSets).
+        let (dirty_set, deleted_set) = {
+            let mut st = self.store.write();
+            st.drain_dirty()
+        };
+
+        // Serialise dirty inodes and read bookkeeping (read lock).
+        let (dirty, deleted, next_ino, total_bytes) = {
+            let st = self.store.read();
+            let dirty: Vec<(u64, Vec<u8>)> = dirty_set.iter()
+                .filter_map(|&ino| {
+                    st.get(ino)
+                        .and_then(|inode| bincode::serialize(inode).ok().map(|d| (ino, d)))
+                })
+                .collect();
+            let deleted: Vec<u64> = deleted_set.into_iter().collect();
+            (dirty, deleted, st.next_ino_val(), st.total_data_bytes())
+        };
+
+        if let Err(e) = db.apply_inode_delta(
+            &dirty, &deleted, next_ino, total_bytes, snap_index, snap_term,
+        ) {
+            warn!("FileStore delta persist failed at index {}: {}", snap_index, e);
         }
     }
 

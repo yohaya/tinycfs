@@ -332,12 +332,13 @@ async fn main() {
             .unwrap_or_else(|| nodes[0].consensus.clone());
 
         for i in 0..args.pre_populate {
-            let path = format!("/vm/{}/2024-01-01T00:00:00Z 10GiB", i);
-            let op = FileOp::Write {
-                path,
-                offset: 0,
-                data: format!("vm snapshot entry {} metadata text", i).into_bytes(),
-            };
+            // Flat root-level paths so write_file's auto-create always succeeds.
+            let path = format!("/vm-{}.img", i);
+            let mut data = vec![0xABu8; args.write_size_bytes.max(64)];
+            let tag = format!("pre-pop-{}", i);
+            let copy_len = tag.len().min(data.len());
+            data[..copy_len].copy_from_slice(tag.as_bytes());
+            let op = FileOp::Write { path, offset: 0, data };
             if let Err(e) = writer.propose(op).await {
                 warn!("Pre-populate write {}: {}", i, e);
             }
