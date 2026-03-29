@@ -66,7 +66,10 @@ impl Log {
 
     /// Truncate the log, removing all entries with index > `last_valid`.
     pub fn truncate_after(&mut self, last_valid: LogIndex) {
-        self.entries.retain(|e| e.index <= last_valid);
+        // Entries are monotonically ordered by index; binary search is O(log n)
+        // vs the O(n) scan that retain() would perform.
+        let keep = self.entries.partition_point(|e| e.index <= last_valid);
+        self.entries.truncate(keep);
     }
 
     /// Append entries from a leader, possibly truncating conflicting entries.

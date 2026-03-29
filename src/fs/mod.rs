@@ -172,6 +172,10 @@ impl Filesystem for TinyCfs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        // Reads are served from the local in-memory store without a network
+        // round-trip (linearizable reads would require a leader heartbeat check
+        // or a read-only log entry — a future improvement). A partitioned old
+        // leader may therefore serve stale data until it rejoins the cluster.
         let store = self.store.read();
         match store.get(ino) {
             Some(Inode::File(f)) => {
@@ -607,6 +611,9 @@ impl Filesystem for TinyCfs {
 
         if sleep {
             // setlkw: block until lock is available or 30 s elapsed.
+            // Use the Tokio timer (via block_on) rather than std::thread::sleep
+            // so the runtime's timer infrastructure is used and the OS can
+            // schedule other work on this thread during the wait interval.
             let deadline = Instant::now() + Duration::from_secs(30);
             let consensus = self.consensus.clone();
             loop {
@@ -616,7 +623,7 @@ impl Filesystem for TinyCfs {
                         return;
                     }
                     Err(TinyCfsError::LockContended(_)) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(100));
+                        self.handle.block_on(tokio::time::sleep(Duration::from_millis(100)));
                     }
                     Err(e) => {
                         reply.error(to_errno(&e));

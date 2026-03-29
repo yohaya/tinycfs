@@ -52,6 +52,10 @@ pub enum TinyCfsError {
     /// File exceeds configured max_file_size_bytes.
     #[error("File too large (limit: {limit} bytes)")]
     FileTooLarge { limit: u64 },
+
+    /// Write would push total filesystem size past max_fs_size_bytes.
+    #[error("No space left on device")]
+    NoSpace,
 }
 
 impl From<std::io::Error> for TinyCfsError {
@@ -85,6 +89,7 @@ pub fn to_errno(e: &TinyCfsError) -> i32 {
         TinyCfsError::InvalidArgument(_) => libc::EINVAL,
         TinyCfsError::LockContended(_) => libc::EWOULDBLOCK,
         TinyCfsError::FileTooLarge { .. } => libc::EFBIG,
+        TinyCfsError::NoSpace => libc::ENOSPC,
         // No quorum / no leader / timeout → filesystem is read-only until a
         // leader is elected. Return EROFS so callers see a clear "read-only"
         // signal rather than a transient resource error.

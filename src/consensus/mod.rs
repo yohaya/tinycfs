@@ -55,6 +55,9 @@ const MAX_ENTRIES_PER_RPC: usize = 1024;
 const PROPOSAL_QUEUE_DEPTH: usize = 32_768;
 /// How long propose() keeps retrying when no leader is available.
 const PROPOSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum number of distinct log indices buffered in deferred_responses.
+/// Guards against unbounded growth when a follower lags behind the leader.
+const MAX_DEFERRED_RESPONSES: usize = 65_536;
 
 // ─── Public proposal API ──────────────────────────────────────────────────────
 
@@ -93,7 +96,9 @@ struct RaftState {
     commit_index: LogIndex,
     last_applied: LogIndex,
     role: Role,
-    pending: Vec<(LogIndex, oneshot::Sender<FileOpResult>)>,
+    /// Callbacks for locally-proposed entries waiting to be committed.
+    /// Keyed by log index for O(1) lookup in advance_applied().
+    pending: HashMap<LogIndex, oneshot::Sender<FileOpResult>>,
     next_req_id: u64,
     /// Next snapshot threshold.
     next_snapshot_at: LogIndex,
@@ -108,7 +113,7 @@ impl RaftState {
             commit_index: 0,
             last_applied: 0,
             role: Role::Follower { leader: None, election_deadline: random_deadline() },
-            pending: Vec::new(),
+            pending: HashMap::new(),
             next_req_id: 1,
             next_snapshot_at: snapshot_every,
         }
@@ -189,6 +194,8 @@ impl Consensus {
         db: Option<RaftDb>,
         store: Arc<RwLock<FileStore>>,
         snapshot_every: u64,
+        max_file_size: u64,
+        max_fs_size: u64,
     ) -> (Self, mpsc::Sender<Envelope>) {
         match algorithm {
             ConsensusAlgorithm::Raft => {
@@ -202,6 +209,11 @@ impl Consensus {
                     RaftState::new(snapshot_every)
                 };
 
+                // Re-apply size limits after potential snapshot restore.
+                // Snapshot deserialization resets serde(skip) fields to their
+                // defaults (0), so the limits must be restored here.
+                store.write().set_limits(max_file_size, max_fs_size);
+
                 let engine = RaftEngine {
                     state,
                     cluster,
@@ -209,6 +221,8 @@ impl Consensus {
                     db,
                     store,
                     snapshot_every,
+                    max_file_size,
+                    max_fs_size,
                     client_pending: HashMap::new(),
                     deferred_responses: HashMap::new(),
                 };
@@ -226,10 +240,12 @@ impl Consensus {
                 let engine = crate::totem::TotemEngine::new(
                     cluster,
                     db,
-                    store,
+                    store.clone(),
                     pub_state.clone(),
                     total_voting,
                 );
+                // Re-apply limits after potential snapshot restore in TotemEngine::new.
+                store.write().set_limits(max_file_size, max_fs_size);
                 tokio::spawn(engine.run(proposal_rx, msg_rx));
 
                 let inner = Arc::new(ConsensusInner::Totem { proposal_tx, pub_state });
@@ -275,6 +291,12 @@ impl Consensus {
                 Ok(Ok(FileOpResult::LockContended(holder))) => {
                     return Err(TinyCfsError::LockContended(holder));
                 }
+                Ok(Ok(FileOpResult::FileTooLarge)) => {
+                    return Err(TinyCfsError::FileTooLarge { limit: 0 });
+                }
+                Ok(Ok(FileOpResult::NoSpace)) => {
+                    return Err(TinyCfsError::NoSpace);
+                }
                 Ok(Err(_)) => {
                     // done_tx dropped (leader step-down / ring reform) — retry.
                     time::sleep(Duration::from_millis(100).min(remaining)).await;
@@ -311,7 +333,17 @@ impl Consensus {
 // ─── State loader ─────────────────────────────────────────────────────────────
 
 fn load_state_from_db(db: &RaftDb, store: &Arc<RwLock<FileStore>>, snapshot_every: u64) -> RaftState {
-    let (term, voted_for) = db.load_meta().unwrap_or((0, None));
+    // Raft safety depends on reading the correct term and voted_for on restart.
+    // Treating a DB error as "no prior state" (term=0, voted_for=None) would
+    // reset the node to a blank slate and allow it to vote in any term,
+    // potentially enabling two leaders in the same term.  Abort instead.
+    let (term, voted_for) = db.load_meta().unwrap_or_else(|e| {
+        panic!(
+            "FATAL: cannot read Raft metadata from persistent store: {e}. \
+             Refusing to start — proceeding with term=0 / voted_for=None would \
+             reset vote history and violate Raft safety."
+        )
+    });
 
     // Load the last saved FileStore snapshot.  The Raft log is NOT persisted —
     // any entries committed after the snapshot will be re-sent by the leader
@@ -322,10 +354,21 @@ fn load_state_from_db(db: &RaftDb, store: &Arc<RwLock<FileStore>>, snapshot_ever
                 Ok(snap_store) => {
                     *store.write() = snap_store;
                     info!("Loaded snapshot at index {} (term {})", si, st);
+                    (si, st)
                 }
-                Err(e) => warn!("Failed to deserialize snapshot: {}", e),
+                Err(e) => {
+                    // Corrupt snapshot: reset to empty rather than anchoring the
+                    // log at (si, st) with an empty store.  Anchoring would apply
+                    // all subsequent entries on a blank state machine, silently
+                    // corrupting every committed file.  Starting from (0, 0) forces
+                    // the leader to re-sync the full history instead.
+                    warn!(
+                        "Failed to deserialize snapshot at index {} — treating as absent: {}",
+                        si, e
+                    );
+                    (0, 0)
+                }
             }
-            (si, st)
         }
         Ok(None) => (0, 0),
         Err(e) => {
@@ -357,7 +400,7 @@ fn load_state_from_db(db: &RaftDb, store: &Arc<RwLock<FileStore>>, snapshot_ever
         commit_index: snapshot_index,
         last_applied: snapshot_index,
         role: Role::Follower { leader: None, election_deadline: random_deadline() },
-        pending: Vec::new(),
+        pending: HashMap::new(),
         next_req_id: 1,
         next_snapshot_at,
     }
@@ -373,6 +416,9 @@ struct RaftEngine {
     store: Arc<RwLock<FileStore>>,
     /// Snapshot interval from config (entries between snapshots).
     snapshot_every: u64,
+    /// Size limits from Config — re-applied to the store after every snapshot restore.
+    max_file_size: u64,
+    max_fs_size: u64,
     /// Forwarded-request callbacks: request_id → oneshot reply to local proposer.
     client_pending: HashMap<u64, oneshot::Sender<FileOpResult>>,
     /// Responses received from the leader before this follower has applied the
@@ -574,7 +620,7 @@ impl RaftEngine {
             };
             self.state.next_req_id += 1;
             self.state.log.append(entry);
-            self.state.pending.push((idx, proposal.done));
+            self.state.pending.insert(idx, proposal.done);
         }
     }
 
@@ -596,7 +642,7 @@ impl RaftEngine {
                     if self.state.last_applied >= log_index {
                         // Entry already applied locally — signal the caller now.
                         let _ = tx.send(result);
-                    } else {
+                    } else if self.deferred_responses.len() < MAX_DEFERRED_RESPONSES {
                         // Entry not yet applied on this follower.  Defer until
                         // advance_applied() reaches log_index so the caller sees
                         // the write in the local store when it wakes up.
@@ -604,6 +650,8 @@ impl RaftEngine {
                             .entry(log_index)
                             .or_default()
                             .push((tx, result));
+                        // If the cap is exceeded: tx drops, done_rx gets Err,
+                        // propose() retries.
                     }
                 }
             }
@@ -721,17 +769,20 @@ impl RaftEngine {
             }
         }
 
+        // Save leader_commit before partially moving ae.entries into
+        // append_leader_entries (Vec<LogEntry> is not Copy).
+        let leader_commit = ae.leader_commit;
         let success = self.state.log.append_leader_entries(
             ae.prev_log_index,
             ae.prev_log_term,
-            ae.entries.clone(),
+            ae.entries,
         );
 
         // No log persistence — the Raft log is in-memory only.
 
-        if success && ae.leader_commit > self.state.commit_index {
+        if success && leader_commit > self.state.commit_index {
             self.state.commit_index =
-                ae.leader_commit.min(self.state.log.last_index());
+                leader_commit.min(self.state.log.last_index());
             self.advance_applied();
         }
 
@@ -841,7 +892,7 @@ impl RaftEngine {
         self.state.log.append(entry);
 
         let (tx, rx) = oneshot::channel::<FileOpResult>();
-        self.state.pending.push((idx, tx));
+        self.state.pending.insert(idx, tx);
 
         let cluster = self.cluster.clone();
         tokio::spawn(async move {
@@ -1078,10 +1129,26 @@ impl RaftEngine {
             return;
         }
 
+        // Persist to DB BEFORE updating in-memory state.  If we updated memory
+        // first and then the DB write failed, a subsequent restart would load the
+        // old (pre-snapshot) state and re-apply entries on stale data.  Writing
+        // to DB first ensures that on any failure we can safely retry.
+        if let Some(db) = &mut self.db {
+            if let Err(e) = db.save_snapshot(is.snapshot_index, is.snapshot_term, &is.data) {
+                warn!("InstallSnapshot: DB save failed, ignoring snapshot: {}", e);
+                // Do not update in-memory state; the leader will retry.
+                return;
+            }
+        }
+
         // Apply the snapshot to the state machine.
         match bincode::deserialize::<crate::fs::store::FileStore>(&is.data) {
             Ok(snap_store) => {
-                *self.store.write() = snap_store;
+                let mut st = self.store.write();
+                *st = snap_store;
+                // serde(skip) fields are reset to 0 by deserialization;
+                // re-apply the configured size limits.
+                st.set_limits(self.max_file_size, self.max_fs_size);
             }
             Err(e) => {
                 warn!("InstallSnapshot deserialize failed: {}", e);
@@ -1094,13 +1161,6 @@ impl RaftEngine {
         self.state.commit_index = is.snapshot_index;
         self.state.last_applied = is.snapshot_index;
         self.state.next_snapshot_at = is.snapshot_index + self.snapshot_every;
-
-        // Persist snapshot + compact the on-disk log.
-        if let Some(db) = &self.db {
-            if let Err(e) = db.save_snapshot(is.snapshot_index, is.snapshot_term, &is.data) {
-                warn!("InstallSnapshot: DB save failed: {}", e);
-            }
-        }
 
         info!(
             "Installed snapshot at index {} (term {})",
@@ -1170,6 +1230,8 @@ impl RaftEngine {
                     Err(TinyCfsError::LockContended(holder)) => {
                         FileOpResult::LockContended(holder.clone())
                     }
+                    Err(TinyCfsError::FileTooLarge { .. }) => FileOpResult::FileTooLarge,
+                    Err(TinyCfsError::NoSpace) => FileOpResult::NoSpace,
                     Err(e) => FileOpResult::Error(e.to_string()),
                 };
 
@@ -1181,14 +1243,9 @@ impl RaftEngine {
                 }
 
                 // Collect callbacks — defer firing until after the DB write.
-                let mut i = 0;
-                while i < self.state.pending.len() {
-                    if self.state.pending[i].0 == idx {
-                        let (_, tx) = self.state.pending.remove(i);
-                        callbacks.push((tx, op_result.clone()));
-                    } else {
-                        i += 1;
-                    }
+                // O(1) HashMap lookup replaces the prior O(n) Vec scan.
+                if let Some(tx) = self.state.pending.remove(&idx) {
+                    callbacks.push((tx, op_result.clone()));
                 }
             }
         }
@@ -1260,10 +1317,16 @@ impl RaftEngine {
 
     // ── Helpers ───────────────────────────────────────────────────────────
 
-    fn persist_meta(&self) {
-        if let Some(db) = &self.db {
+    fn persist_meta(&mut self) {
+        if let Some(db) = &mut self.db {
             if let Err(e) = db.save_term(self.state.current_term, self.state.voted_for) {
-                warn!("DB: failed to persist term: {}", e);
+                // Raft safety depends on this write: if we continue after a
+                // failed persist we may vote again in this term after a restart.
+                panic!(
+                    "FATAL: failed to persist Raft metadata \
+                     (term={}, voted_for={:?}): {}",
+                    self.state.current_term, self.state.voted_for, e
+                );
             }
         }
     }

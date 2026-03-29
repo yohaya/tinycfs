@@ -200,6 +200,8 @@ async fn main() {
             None,
             store.clone(),
             config.snapshot_every as u64,
+            0, // no per-file size limit in simulation
+            0, // no total-fs size limit in simulation
         );
 
         // Forward inbound cluster messages to the Raft actor.

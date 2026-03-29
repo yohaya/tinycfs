@@ -186,7 +186,8 @@ async fn main() {
     // Consensus::new loads snapshot + log from DB (if any) into `store`.
     info!("Consensus algorithm: {:?}", config.algorithm);
     let (consensus, msg_tx) =
-        Consensus::new(config.algorithm.clone(), cluster_handle.clone(), db, store.clone(), config.snapshot_every as u64);
+        Consensus::new(config.algorithm.clone(), cluster_handle.clone(), db, store.clone(),
+            config.snapshot_every as u64, config.max_file_size_bytes, config.max_fs_size_bytes);
 
     // Forward inbound cluster messages to the Raft actor.
     let rx_in = cluster_handle.rx_in.clone();

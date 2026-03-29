@@ -54,6 +54,13 @@ pub struct FileStore {
     /// without this field deserialize to 0 and self-correct on next write.
     #[serde(default)]
     total_data_bytes: u64,
+    /// Per-file and total-filesystem size limits sourced from Config.
+    /// Not serialized — must be re-applied via `set_limits` after every
+    /// snapshot restore.  Default 0 means "no limit enforced".
+    #[serde(skip, default)]
+    max_file_size_bytes: u64,
+    #[serde(skip, default)]
+    max_fs_size_bytes: u64,
 }
 
 impl FileStore {
@@ -72,7 +79,14 @@ impl FileStore {
             ctime: SystemTime::now(),
         };
         inodes.insert(ROOT_INO, Inode::Dir(DirInode { meta: root_meta, parent_ino: ROOT_INO, entries: HashMap::new() }));
-        FileStore { inodes, next_ino: 2, locks: HashMap::new(), total_data_bytes: 0 }
+        FileStore {
+            inodes,
+            next_ino: 2,
+            locks: HashMap::new(),
+            total_data_bytes: 0,
+            max_file_size_bytes: 0,
+            max_fs_size_bytes: 0,
+        }
     }
 
     fn alloc_ino(&mut self) -> Ino {
@@ -98,6 +112,14 @@ impl FileStore {
     /// Total bytes of file data currently held across all files.
     pub fn total_data_bytes(&self) -> u64 {
         self.total_data_bytes
+    }
+
+    /// Set per-file and total-filesystem size limits.  Must be called after
+    /// store creation and after every snapshot restore because these fields are
+    /// not persisted (`serde::skip`).
+    pub fn set_limits(&mut self, max_file_size: u64, max_fs_size: u64) {
+        self.max_file_size_bytes = max_file_size;
+        self.max_fs_size_bytes = max_fs_size;
     }
 
     pub fn readdir(&self, ino: Ino) -> Result<Vec<(String, Ino, InoKind)>> {
@@ -303,6 +325,15 @@ impl FileStore {
     }
 
     fn write_file(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<()> {
+        // Enforce per-file size limit in the state machine so the check is
+        // atomic with the write and cannot be raced by concurrent proposals
+        // from other nodes (TOCTOU).  The FUSE layer also pre-checks this as
+        // an advisory fast-path, but this check is the authoritative one.
+        let end = offset + data.len() as u64;
+        if self.max_file_size_bytes > 0 && end > self.max_file_size_bytes {
+            return Err(TinyCfsError::FileTooLarge { limit: self.max_file_size_bytes });
+        }
+
         // Auto-create the file if it does not exist (upsert semantics).
         if self.resolve_path(path).is_err() {
             self.create_file(path, 0o644, 0, 0)?;
@@ -311,11 +342,18 @@ impl FileStore {
         match self.inodes.get_mut(&ino) {
             Some(Inode::File(f)) => {
                 let old_size = f.data.len() as u64;
-                let end = (offset as usize) + data.len();
-                if end > f.data.len() {
-                    f.data.resize(end, 0);
+                // Enforce total filesystem size limit.
+                let growth = end.saturating_sub(old_size);
+                if self.max_fs_size_bytes > 0
+                    && self.total_data_bytes.saturating_add(growth) > self.max_fs_size_bytes
+                {
+                    return Err(TinyCfsError::NoSpace);
                 }
-                f.data[offset as usize..end].copy_from_slice(data);
+                let end_usize = end as usize;
+                if end_usize > f.data.len() {
+                    f.data.resize(end_usize, 0);
+                }
+                f.data[offset as usize..end_usize].copy_from_slice(data);
                 f.meta.mtime = SystemTime::now();
                 let new_size = f.data.len() as u64;
                 self.total_data_bytes =
@@ -332,6 +370,18 @@ impl FileStore {
         match self.inodes.get_mut(&ino) {
             Some(Inode::File(f)) => {
                 let old_size = f.data.len() as u64;
+                if size > old_size {
+                    // Truncate-up: enforce per-file and total size limits.
+                    if self.max_file_size_bytes > 0 && size > self.max_file_size_bytes {
+                        return Err(TinyCfsError::FileTooLarge { limit: self.max_file_size_bytes });
+                    }
+                    let growth = size - old_size;
+                    if self.max_fs_size_bytes > 0
+                        && self.total_data_bytes.saturating_add(growth) > self.max_fs_size_bytes
+                    {
+                        return Err(TinyCfsError::NoSpace);
+                    }
+                }
                 f.data.resize(size as usize, 0);
                 f.meta.mtime = SystemTime::now();
                 self.total_data_bytes =

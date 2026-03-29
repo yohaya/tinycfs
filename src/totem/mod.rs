@@ -786,6 +786,12 @@ pub async fn propose(tx: mpsc::Sender<Proposal>, op: FileOp) -> Result<()> {
             Ok(Ok(FileOpResult::LockContended(h))) => {
                 return Err(TinyCfsError::LockContended(h));
             }
+            Ok(Ok(FileOpResult::FileTooLarge)) => {
+                return Err(TinyCfsError::FileTooLarge { limit: 0 });
+            }
+            Ok(Ok(FileOpResult::NoSpace)) => {
+                return Err(TinyCfsError::NoSpace);
+            }
             Ok(Err(_)) => {
                 // done_tx dropped (ring reform) — retry
                 time::sleep(Duration::from_millis(100).min(remaining)).await;

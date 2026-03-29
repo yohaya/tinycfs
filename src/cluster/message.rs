@@ -104,6 +104,10 @@ pub enum FileOpResult {
     /// Lock is held by the named holder — used to propagate LockContended back
     /// to the proposer so it can return EWOULDBLOCK or retry (setlkw).
     LockContended(String),
+    /// Write rejected by state machine: per-file size limit exceeded (EFBIG).
+    FileTooLarge,
+    /// Write rejected by state machine: total filesystem size limit exceeded (ENOSPC).
+    NoSpace,
 }
 
 // ─── Raft messages ───────────────────────────────────────────────────────────

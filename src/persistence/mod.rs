@@ -26,8 +26,8 @@ pub struct RaftDb {
     conn: Connection,
 }
 
-// Connection is Send (not Sync). RaftDb is used exclusively from the single
-// Raft actor task, so Send is all we need.
+// SAFETY: Connection is Send but not Sync. RaftDb is only ever accessed from
+// the single Raft actor task — no concurrent access is possible.
 unsafe impl Send for RaftDb {}
 
 impl RaftDb {
@@ -60,29 +60,35 @@ impl RaftDb {
     // ── Raft metadata ─────────────────────────────────────────────────────────
 
     /// Persist current_term and voted_for atomically.
-    pub fn save_term(&self, term: Term, voted_for: Option<NodeId>) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('term', ?1)",
-                params![term as i64],
-            )
+    ///
+    /// Both values are written inside a single SQLite transaction.  Without
+    /// a transaction a crash between the two writes can leave `term` advanced
+    /// while `voted_for` is stale (or absent), which would let the node vote
+    /// twice in the same term after restart — a Raft safety violation.
+    pub fn save_term(&mut self, term: Term, voted_for: Option<NodeId>) -> Result<()> {
+        let tx = self.conn
+            .transaction()
             .map_err(|e| TinyCfsError::Io(e.to_string()))?;
+
+        tx.execute(
+            "INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('term', ?1)",
+            params![term as i64],
+        ).map_err(|e| TinyCfsError::Io(e.to_string()))?;
 
         match voted_for {
             Some(v) => {
-                self.conn
-                    .execute(
-                        "INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('voted_for', ?1)",
-                        params![v as i64],
-                    )
-                    .map_err(|e| TinyCfsError::Io(e.to_string()))?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO raft_meta (key, value) VALUES ('voted_for', ?1)",
+                    params![v as i64],
+                ).map_err(|e| TinyCfsError::Io(e.to_string()))?;
             }
             None => {
-                self.conn
-                    .execute("DELETE FROM raft_meta WHERE key = 'voted_for'", [])
+                tx.execute("DELETE FROM raft_meta WHERE key = 'voted_for'", [])
                     .map_err(|e| TinyCfsError::Io(e.to_string()))?;
             }
         }
+
+        tx.commit().map_err(|e| TinyCfsError::Io(e.to_string()))?;
         Ok(())
     }
 
