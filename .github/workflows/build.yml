@@ -52,6 +52,8 @@ jobs:
             -v "$GITHUB_WORKSPACE:/src" \
             -w /src \
             --env CARGO_TERM_COLOR=always \
+            --env TINYCFS_BUILD_NUMBER=${{ github.run_number }} \
+            --env TINYCFS_GIT_SHA=${{ github.sha }} \
             "${{ matrix.image }}" \
             bash -eux -c '
               export DEBIAN_FRONTEND=noninteractive
@@ -104,6 +106,9 @@ jobs:
         run: rustup target add x86_64-unknown-linux-musl
 
       - name: Build static musl binary
+        env:
+          TINYCFS_BUILD_NUMBER: ${{ github.run_number }}
+          TINYCFS_GIT_SHA: ${{ github.sha }}
         run: |
           cargo build --release --locked --target x86_64-unknown-linux-musl 2>&1
           # Verify it is truly statically linked

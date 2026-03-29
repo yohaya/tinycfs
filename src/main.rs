@@ -22,7 +22,7 @@ use tinycfs::syslog_layer::SyslogLayer;
 #[derive(Parser, Debug)]
 #[command(
     name = "tinycfs",
-    version,
+    version = env!("TINYCFS_VERSION"),
     about = "Tiny Cluster File System — distributed shared filesystem for small files",
     long_about = "Mount a POSIX-compliant shared filesystem on each cluster node.\n\
                   All nodes see the same files; writes are replicated via Raft consensus.\n\
@@ -146,7 +146,8 @@ async fn main() {
         .join(", ");
     // Note: mountpoint is resolved after config load, so we log it later.
     SyslogLayer::startup(&format!(
-        "starting node='{}' cluster='{}' peers=[{}]",
+        "starting v{} node='{}' cluster='{}' peers=[{}]",
+        env!("TINYCFS_VERSION"),
         config.local_node,
         config.cluster_name,
         peer_list,
