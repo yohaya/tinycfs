@@ -205,7 +205,8 @@ Type=simple
 ExecStartPre=/bin/mkdir -p ${MOUNT_POINT}
 ExecStart=${INSTALL_BIN} ${MOUNT_POINT} \\
     --config ${CONFIG_FILE} \\
-    --allow-other
+    --allow-other \\
+    --no-auto-unmount
 # Unmount on stop; '-' prefix means failure is not fatal (already unmounted)
 ExecStop=-/bin/fusermount3 -u ${MOUNT_POINT}
 ExecStop=-/bin/fusermount -u ${MOUNT_POINT}
