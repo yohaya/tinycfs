@@ -1531,7 +1531,16 @@ impl RaftEngine {
                 info!("[{}] Joined cluster as LEADER (term {}): filesystem read-write",
                     node, ps.current_term);
             } else {
-                let leader = ps.leader_id.map(|id| format!("{:x}", id)).unwrap_or_default();
+                let leader = ps.leader_id.map(|id| {
+                    let name = self.cluster.peers.read()
+                        .get(&id).cloned()
+                        .unwrap_or_default();
+                    if name.is_empty() {
+                        format!("{:x}", id)
+                    } else {
+                        format!("{:x} ({})", id, name)
+                    }
+                }).unwrap_or_default();
                 info!("[{}] Joined cluster as follower (term {}, leader {}): filesystem read-write",
                     node, ps.current_term, leader);
             }
