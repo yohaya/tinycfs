@@ -100,6 +100,11 @@ struct RaftState {
     /// Configurable election timeouts (carried here so become_follower can use them).
     election_timeout_min_ms: u64,
     election_timeout_max_ms: u64,
+    /// Set when the node was loaded from SQLite with snapshot_index=0 but a
+    /// non-empty FileStore (unanchored state).  On first AppendEntries from the
+    /// leader the node discards its data and forces InstallSnapshot to sync.
+    /// Cleared when the node wins an election (its data becomes authoritative).
+    needs_leader_sync: bool,
 }
 
 impl RaftState {
@@ -119,6 +124,7 @@ impl RaftState {
             next_snapshot_at: snapshot_every,
             election_timeout_min_ms,
             election_timeout_max_ms,
+            needs_leader_sync: false,
         }
     }
 
@@ -397,14 +403,34 @@ fn load_state_from_db(
     // Load persisted filesystem state.  Try the new per-inode table first;
     // fall back to the legacy blob snapshot for databases written by older
     // versions or populated via InstallSnapshot before the first delta persist.
+    let mut needs_leader_sync = false;
     let (snapshot_index, snapshot_term) = match db.load_fs_state() {
         Ok(Some((inode_rows, next_ino, total_bytes, si, st))) => {
+            let inode_count = inode_rows.len();
             let inodes: std::collections::HashMap<crate::fs::inode::Ino, crate::fs::inode::Inode> =
                 inode_rows.into_iter().collect();
             let loaded = FileStore::from_parts(inodes, next_ino, total_bytes);
             *store.write() = loaded;
-            info!("Loaded per-inode state at index {} (term {})", si, st);
-            (si, st)
+
+            // snapshot_index=0 with non-empty inodes means the persisted FileStore
+            // is not anchored to any committed Raft log entry — e.g. from an older
+            // version, a migration, or a crash before the first delta was written.
+            // Use a synthetic index=1 as the log base so the leader can detect the
+            // discrepancy and push InstallSnapshot.  The node will discard its data
+            // on first contact with the leader (see on_append_entries).
+            if si == 0 && inode_count > 0 {
+                needs_leader_sync = true;
+                warn!(
+                    "Loaded {} inodes with snapshot_index=0 — state is not anchored in the \
+                     Raft log. Using synthetic index 1; will discard and sync from leader \
+                     on first contact to ensure consistency.",
+                    inode_count
+                );
+                (1u64, 0u64)
+            } else {
+                info!("Loaded per-inode state at index {} (term {})", si, st);
+                (si, st)
+            }
         }
         Ok(None) => {
             // Fall back to legacy full-blob snapshot (older DB or post-InstallSnapshot).
@@ -438,8 +464,9 @@ fn load_state_from_db(
     log.set_snapshot_base(snapshot_index, snapshot_term);
 
     info!(
-        "Loaded term={}, voted_for={:?}, starting from snapshot index {}",
-        term, voted_for, snapshot_index
+        "Loaded term={}, voted_for={:?}, starting from snapshot index {}{}",
+        term, voted_for, snapshot_index,
+        if needs_leader_sync { " (synthetic — will sync from leader)" } else { "" }
     );
 
     let next_snapshot_at = if snapshot_index == 0 {
@@ -463,6 +490,7 @@ fn load_state_from_db(
         next_snapshot_at,
         election_timeout_min_ms,
         election_timeout_max_ms,
+        needs_leader_sync,
     }
 }
 
@@ -796,6 +824,8 @@ impl RaftEngine {
                         "Elected leader for term {} ({}/{} votes)",
                         self.state.current_term, n_votes, self.cluster.total_voting_nodes
                     );
+                    // This node is now the authoritative source — no need to sync from anyone.
+                    self.state.needs_leader_sync = false;
                     let last_index = self.state.log.last_index();
                     let peer_ids = self.cluster.peer_ids();
                     self.state.role = Role::Leader {
@@ -838,6 +868,34 @@ impl RaftEngine {
                     self.persist_meta();
                 }
             }
+        }
+
+        // If this node loaded a FileStore from SQLite that is not anchored to any
+        // committed Raft log entry (snapshot_index=0 with data), we cannot trust
+        // our state matches the leader's.  Discard it and reply with failure so
+        // the leader backs next_index down to 1, which satisfies the condition
+        // ni ≤ log.snapshot_index and causes the leader to send InstallSnapshot.
+        if self.state.needs_leader_sync {
+            self.state.needs_leader_sync = false;
+            *self.store.write() = FileStore::new();
+            self.state.log.set_snapshot_base(0, 0);
+            self.state.commit_index = 0;
+            self.state.last_applied = 0;
+            self.last_persisted = 0;
+            warn!(
+                "[{}] Discarding unanchored SQLite state — requesting full sync from leader",
+                self.cluster.local_name
+            );
+            self.update_pub_state();
+            self.cluster.send(
+                from,
+                Message::AppendEntriesReply(AppendEntriesReply {
+                    term: self.state.current_term,
+                    success: false,
+                    match_index: 0,
+                }),
+            );
+            return;
         }
 
         // Save leader_commit before partially moving ae.entries into
@@ -1010,6 +1068,8 @@ impl RaftEngine {
                 "Single-node cluster: self-elected leader for term {} (quorum {})",
                 term, quorum
             );
+            // This node is now the authoritative source — no need to sync from anyone.
+            self.state.needs_leader_sync = false;
             let last_index = self.state.log.last_index();
             let peer_ids = self.cluster.peer_ids();
             self.state.role = Role::Leader {
