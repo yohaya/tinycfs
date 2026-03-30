@@ -1511,6 +1511,7 @@ impl RaftEngine {
 
     fn update_pub_state(&self) {
         let mut ps = self.pub_state.write();
+        let prev_quorum = ps.has_quorum;
         ps.is_leader = self.state.is_leader();
         ps.leader_id = self.state.leader_id();
         ps.current_term = self.state.current_term;
@@ -1523,6 +1524,21 @@ impl RaftEngine {
         } else {
             matches!(&self.state.role, Role::Follower { leader: Some(_), .. })
         };
+        // Log cluster-health transitions so operators can see join/leave events.
+        let node = &self.cluster.local_name;
+        if !prev_quorum && ps.has_quorum {
+            if ps.is_leader {
+                info!("[{}] Joined cluster as LEADER (term {}): filesystem read-write",
+                    node, ps.current_term);
+            } else {
+                let leader = ps.leader_id.map(|id| format!("{:x}", id)).unwrap_or_default();
+                info!("[{}] Joined cluster as follower (term {}, leader {}): filesystem read-write",
+                    node, ps.current_term, leader);
+            }
+        } else if prev_quorum && !ps.has_quorum {
+            warn!("[{}] Lost cluster quorum (term {}): filesystem is now READ-ONLY until leader re-establishes",
+                node, ps.current_term);
+        }
         // Extended status
         ps.commit_index = self.state.commit_index;
         ps.last_applied = self.state.last_applied;

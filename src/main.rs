@@ -231,6 +231,10 @@ async fn main() {
     // ── Consensus engine ──────────────────────────────────────────────────
     // Consensus::new loads snapshot + log from DB (if any) into `store`.
     info!("Consensus algorithm: {:?}", config.algorithm);
+    info!("[{}] Starting up — trying to join cluster '{}' (peers: {})",
+        config.local_node,
+        config.cluster_name,
+        config.peer_nodes().map(|n| n.name.as_str()).collect::<Vec<_>>().join(", "));
     let (consensus, msg_tx) =
         Consensus::new(config.algorithm.clone(), cluster_handle.clone(), db, store.clone(),
             config.snapshot_every as u64, config.persist_every as u64,

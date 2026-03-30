@@ -17,7 +17,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
@@ -123,6 +123,19 @@ struct Args {
     /// Default: 64 (tiny, exercises proposal overhead only).
     #[arg(long, default_value = "64")]
     write_size_bytes: usize,
+
+    /// Simulate a node crash at this many seconds after the load test starts.
+    /// Node 0 is abruptly stopped (in-memory state discarded); if --with-db is
+    /// set, the node reloads from its persisted SQLite snapshot at restart time.
+    /// Requires --restart-at-secs.
+    #[arg(long)]
+    crash_at_secs: Option<u64>,
+
+    /// Restart the crashed node at this many seconds after the load test starts.
+    /// If --with-db was set, the node recovers from its last persisted snapshot
+    /// and re-syncs via Raft catch-up.  Requires --crash-at-secs.
+    #[arg(long)]
+    restart_at_secs: Option<u64>,
 }
 
 // ─── Per-node handle ──────────────────────────────────────────────────────────
@@ -131,6 +144,11 @@ struct SimNode {
     consensus: Consensus,
     store: Arc<RwLock<FileStore>>,
     db_dir: Option<tempfile::TempDir>,
+    /// Preserved so crash-restart can recreate the consensus from the saved DB.
+    cluster_handle: tinycfs::cluster::ClusterHandle,
+    config: tinycfs::config::Config,
+    /// Handle to the message-forwarding task; aborted on simulated crash.
+    fwd_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 // ─── Latency histogram (lock-free, microsecond buckets) ───────────────────────
@@ -295,7 +313,7 @@ async fn main() {
 
         // Forward inbound cluster messages to the consensus actor.
         let rx_in = cluster_handle.rx_in.clone();
-        tokio::spawn(async move {
+        let fwd_task = tokio::spawn(async move {
             loop {
                 let env = rx_in.lock().await.recv().await;
                 match env {
@@ -305,7 +323,7 @@ async fn main() {
             }
         });
 
-        nodes.push(SimNode { consensus, store, db_dir });
+        nodes.push(SimNode { consensus, store, db_dir, cluster_handle, config, fwd_task: Some(fwd_task) });
     }
 
     // ── Wait for leader election ───────────────────────────────────────────
@@ -400,6 +418,117 @@ async fn main() {
         });
     }
 
+    // ── Crash-restart injection ────────────────────────────────────────────
+    // Simulates a process crash on node 0: abruptly discards all in-memory
+    // Raft state, then restores from the SQLite snapshot (if --with-db).
+    // Verifies that a crashed node can always re-join and converge to the
+    // same consistent state as the rest of the cluster.
+    //
+    // crashed_idx: usize::MAX = no crash; any other value = that node index
+    // is currently down.  The load test reads this to skip crashed nodes so
+    // it does not count expected timeouts as failures.
+    let crashed_idx = Arc::new(AtomicUsize::new(usize::MAX));
+
+    if let (Some(crash_at), Some(restart_at)) = (args.crash_at_secs, args.restart_at_secs) {
+        if !args.with_db {
+            eprintln!("WARNING: --crash-at-secs/--restart-at-secs without --with-db: \
+                       the restarted node starts from an empty store and re-syncs via \
+                       InstallSnapshot from the leader.");
+        }
+
+        // Extract node 0's data before the task moves them.
+        let node0_store         = nodes[0].store.clone();
+        let node0_cluster       = nodes[0].cluster_handle.clone();
+        let node0_config        = nodes[0].config.clone();
+        let node0_db_dir        = nodes[0].db_dir.take();   // keep TempDir alive through restart
+        let node0_fwd_task      = nodes[0].fwd_task.take(); // aborted at crash time
+
+        let opts_c       = all_opts.clone();
+        let ids_c        = node_ids.clone();
+        let n            = args.nodes;
+        let algorithm_c  = algorithm.clone();
+        let crashed_c    = crashed_idx.clone();
+
+        tokio::spawn(async move {
+            // ── Crash ─────────────────────────────────────────────────────
+            time::sleep(Duration::from_secs(crash_at)).await;
+
+            // Tell the load test to stop sending proposals to node 0.
+            crashed_c.store(0, Ordering::Release);
+
+            // Fully isolate node 0 from the rest of the cluster.
+            for j in 1..n {
+                opts_c[0].blocked_peers.write().insert(ids_c[j]);
+                opts_c[j].blocked_peers.write().insert(ids_c[0]);
+            }
+            warn!("═══ CRASH at {}s: node 0 crashed (in-memory state discarded) ═══", crash_at);
+
+            // Replace in-memory state with an empty store — simulates the OS
+            // killing the process and losing all heap state.
+            *node0_store.write() = FileStore::new();
+
+            // Abort the old message-forwarding task so it stops delivering
+            // messages to the (now-crashed) Raft actor.  Wait for full
+            // cancellation before starting the new forwarding loop.
+            if let Some(handle) = node0_fwd_task {
+                handle.abort();
+                let _ = handle.await;
+            }
+
+            // Re-open the persisted DB (loads the last committed snapshot).
+            let db = if let Some(ref dir) = node0_db_dir {
+                let db_path = dir.path().join("raft.db");
+                tinycfs::persistence::RaftDb::open(&db_path).ok()
+            } else {
+                None
+            };
+
+            // Rebuild the Raft engine from persisted state (empty if no DB).
+            let (new_consensus, new_msg_tx) = Consensus::new(
+                algorithm_c,
+                node0_cluster.clone(),
+                db,
+                node0_store.clone(),
+                node0_config.snapshot_every as u64,
+                node0_config.persist_every as u64,
+                0, 0,
+                node0_config.heartbeat_interval_ms,
+                node0_config.election_timeout_min_ms,
+                node0_config.election_timeout_max_ms,
+            );
+
+            // New forwarding loop — node is still isolated, so no messages
+            // arrive until the restart below unblocks the peers.
+            let rx_in = node0_cluster.rx_in.clone();
+            tokio::spawn(async move {
+                loop {
+                    let env = rx_in.lock().await.recv().await;
+                    match env {
+                        Some(e) => { if new_msg_tx.send(e).await.is_err() { break; } }
+                        None => break,
+                    }
+                }
+            });
+
+            // ── Restart ───────────────────────────────────────────────────
+            time::sleep(Duration::from_secs(restart_at - crash_at)).await;
+
+            // Unblock — node 0 can now receive and send cluster messages again.
+            for opt in opts_c.iter() { opt.blocked_peers.write().clear(); }
+            warn!("═══ RESTART at {}s: node 0 rejoining cluster \
+                   (recovering from persisted snapshot) ═══", restart_at);
+
+            // Keep the new consensus and TempDir alive for the rest of the test.
+            // The consistency checker reads nodes[0].store (the same Arc that
+            // new_consensus writes into) so convergence is automatically visible.
+            // crashed_c stays at 0 during catch-up; clearing it would route load-
+            // test proposals back to the old (crashed) consensus handle in
+            // `consensuses`, causing spurious timeouts.
+            let _alive = (new_consensus, node0_db_dir);
+            std::future::pending::<()>().await
+        });
+    }
+
     // ── Load test ─────────────────────────────────────────────────────────
     let ok_count = Arc::new(AtomicU64::new(0));
     let err_count = Arc::new(AtomicU64::new(0));
@@ -407,6 +536,7 @@ async fn main() {
 
     let consensuses: Arc<Vec<Consensus>> =
         Arc::new(nodes.iter().map(|n| n.consensus.clone()).collect());
+    let n_nodes = consensuses.len();
 
     let duration = Duration::from_secs(args.duration_secs);
     let interval_ns = 1_000_000_000u64 / args.rps.max(1);
@@ -424,7 +554,13 @@ async fn main() {
         next_tick += Duration::from_nanos(interval_ns);
         seq += 1;
 
-        let node_idx = rand::thread_rng().gen_range(0..consensuses.len());
+        // Skip any node that is currently simulating a crash — proposals to
+        // it would time out rather than fail fast, skewing the success rate.
+        let crashed = crashed_idx.load(Ordering::Relaxed);
+        let node_idx = loop {
+            let idx = rand::thread_rng().gen_range(0..n_nodes);
+            if idx != crashed { break idx; }
+        };
         let consensus = consensuses[node_idx].clone();
         let ok = ok_count.clone();
         let err = err_count.clone();
@@ -500,6 +636,12 @@ async fn main() {
         println!(" Partition:        at {}s (size {}), heal {}",
             at, partition_size,
             args.heal_at_secs.map(|h| format!("at {}s", h)).unwrap_or_else(|| "never".into()));
+    }
+    if let Some(at) = args.crash_at_secs {
+        println!(" Crash/Restart:    node 0 crashed at {}s, restarted at {}s{}",
+            at,
+            args.restart_at_secs.map(|r| format!("{}", r)).unwrap_or_else(|| "never".into()),
+            if args.with_db { " (recovered from SQLite snapshot)" } else { " (empty store, re-synced via InstallSnapshot)" });
     }
     println!(" Target RPS:       {}", args.rps);
     let write_size_str = if args.write_size_bytes >= 1024 {

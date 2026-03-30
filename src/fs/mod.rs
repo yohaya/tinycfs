@@ -9,9 +9,10 @@ use fuser::{
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use parking_lot::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::runtime::Handle;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::cluster::message::FileOp;
 use crate::consensus::Consensus;
@@ -33,6 +34,10 @@ pub struct TinyCfs {
     max_file_size: u64,
     /// Maximum total filesystem size in bytes across all files.
     max_fs_size: u64,
+    /// Logged once when a write is first rejected because the cluster has no
+    /// quorum; reset when quorum is regained so the message fires again on the
+    /// next outage.
+    logged_readonly_warn: Arc<AtomicBool>,
 }
 
 impl TinyCfs {
@@ -44,7 +49,8 @@ impl TinyCfs {
         max_file_size: u64,
         max_fs_size: u64,
     ) -> Self {
-        TinyCfs { handle, consensus, store, node_name, max_file_size, max_fs_size }
+        TinyCfs { handle, consensus, store, node_name, max_file_size, max_fs_size,
+            logged_readonly_warn: Arc::new(AtomicBool::new(false)) }
     }
 
     fn path_for(&self, parent: u64, name: &OsStr) -> Option<String> {
@@ -112,7 +118,19 @@ impl TinyCfs {
     /// block for the full 30-second propose() timeout.
     #[inline]
     fn cluster_writeable(&self) -> bool {
-        self.consensus.has_quorum()
+        let writeable = self.consensus.has_quorum();
+        if !writeable {
+            // Log the read-only condition once per outage (not on every rejected op).
+            if !self.logged_readonly_warn.swap(true, Ordering::Relaxed) {
+                warn!("[{}] Filesystem is READ-ONLY: no cluster quorum yet \
+                       (leader not elected or node not connected to leader)",
+                    self.node_name);
+            }
+        } else {
+            // Reset so the warning fires again on the next outage.
+            self.logged_readonly_warn.store(false, Ordering::Relaxed);
+        }
+        writeable
     }
 }
 
