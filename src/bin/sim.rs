@@ -66,7 +66,7 @@ struct Args {
     base_port: u16,
 
     /// Warm-up period before measuring (seconds).
-    #[arg(long, default_value = "3")]
+    #[arg(long, default_value = "6")]
     warmup_secs: u64,
 
     /// Consensus algorithm: "raft" (default) or "totem".
@@ -85,6 +85,10 @@ struct Args {
     /// Heal the partition at this many seconds after the load test starts.
     #[arg(long)]
     heal_at_secs: Option<u64>,
+
+    /// How long to wait after the load test for final commits to flush (seconds).
+    #[arg(long, default_value = "10")]
+    flush_secs: u64,
 
     /// How many nodes to put in the minority partition (default: half).
     #[arg(long)]
@@ -224,6 +228,8 @@ async fn main() {
         .collect();
 
     // Each node gets its own ClusterOptions with a distinct blocked_peers Arc.
+    // Allow InstallSnapshot messages up to max_fs_size_bytes + 32 MiB overhead.
+    let sim_max_fs: usize = 4 * 1024 * 1024 * 1024; // matches max_fs_size_bytes in sim Config
     let all_opts: Vec<ClusterOptions> = (0..args.nodes)
         .map(|_| ClusterOptions {
             network_delay: Some((
@@ -232,6 +238,7 @@ async fn main() {
             )),
             packet_loss: args.packet_loss_pct / 100.0,
             blocked_peers: Arc::new(RwLock::new(HashSet::new())),
+            max_message_size_bytes: sim_max_fs + 32 * 1024 * 1024,
         })
         .collect();
 
@@ -446,8 +453,8 @@ async fn main() {
     }
 
     let total_elapsed = start.elapsed();
-    info!("Load test done. Waiting 2s for final commits to flush…");
-    time::sleep(Duration::from_secs(2)).await;
+    info!("Load test done. Waiting {}s for final commits to flush…", args.flush_secs);
+    time::sleep(Duration::from_secs(args.flush_secs)).await;
 
     // ── Consistency check ──────────────────────────────────────────────────
     use std::collections::hash_map::DefaultHasher;

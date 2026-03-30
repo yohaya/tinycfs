@@ -9,7 +9,7 @@ use tracing::{error, info};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
-use tinycfs::cluster::Cluster;
+use tinycfs::cluster::{Cluster, ClusterOptions};
 use tinycfs::config::Config;
 use tinycfs::consensus::Consensus;
 use tinycfs::fs::store::FileStore;
@@ -221,7 +221,12 @@ async fn main() {
     let store: Arc<RwLock<FileStore>> = Arc::new(RwLock::new(FileStore::new()));
 
     // ── Cluster networking ────────────────────────────────────────────────
-    let (cluster_handle, _cluster) = Cluster::start(config.clone()).await;
+    // Allow InstallSnapshot messages up to max_fs_size_bytes + 32 MiB overhead.
+    let cluster_opts = ClusterOptions {
+        max_message_size_bytes: config.max_fs_size_bytes as usize + 32 * 1024 * 1024,
+        ..Default::default()
+    };
+    let (cluster_handle, _cluster) = Cluster::start_with_opts(config.clone(), cluster_opts).await;
 
     // ── Consensus engine ──────────────────────────────────────────────────
     // Consensus::new loads snapshot + log from DB (if any) into `store`.

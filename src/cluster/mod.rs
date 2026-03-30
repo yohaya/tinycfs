@@ -110,6 +110,11 @@ pub struct ClusterOptions {
     /// Shared Arc allows runtime partition injection without reconnection:
     /// insert a peer ID to partition, remove to heal.
     pub blocked_peers: Arc<RwLock<HashSet<NodeId>>>,
+    /// Maximum inbound message size in bytes.  Messages larger than this are
+    /// rejected and the connection is closed.  Must be at least as large as the
+    /// maximum InstallSnapshot payload, i.e. max_fs_size_bytes + metadata
+    /// overhead.  Default: 1 GiB (matches the default max_fs_size_bytes).
+    pub max_message_size_bytes: usize,
 }
 
 impl Default for ClusterOptions {
@@ -118,6 +123,7 @@ impl Default for ClusterOptions {
             network_delay: None,
             packet_loss: 0.0,
             blocked_peers: Arc::new(RwLock::new(HashSet::new())),
+            max_message_size_bytes: 1 * 1024 * 1024 * 1024, // 1 GiB
         }
     }
 }
@@ -174,6 +180,7 @@ impl Cluster {
         let delay2 = opts.network_delay;
         let pl2 = opts.packet_loss;
         let bp2 = opts.blocked_peers.clone();
+        let mms2 = opts.max_message_size_bytes;
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -183,7 +190,7 @@ impl Cluster {
                         let peers = peers2.clone();
                         let env_tx = env_tx2.clone();
                         let cfg = cfg2.clone();
-                        tokio::spawn(handle_incoming(stream, lid, cfg, conns, peers, env_tx, delay2, pl2, bp2.clone()));
+                        tokio::spawn(handle_incoming(stream, lid, cfg, conns, peers, env_tx, delay2, pl2, bp2.clone(), mms2));
                     }
                     Err(e) => error!("Accept error: {}", e),
                 }
@@ -231,7 +238,8 @@ impl Cluster {
             let delay = opts.network_delay;
             let packet_loss = opts.packet_loss;
             let blocked_peers = opts.blocked_peers.clone();
-            tokio::spawn(connect_to_peer(peer, lid, cfg, conns, peers, env_tx, delay, packet_loss, blocked_peers));
+            let mms = opts.max_message_size_bytes;
+            tokio::spawn(connect_to_peer(peer, lid, cfg, conns, peers, env_tx, delay, packet_loss, blocked_peers, mms));
         }
 
         let handle = ClusterHandle {
@@ -261,6 +269,7 @@ async fn connect_to_peer(
     delay: Option<(Duration, Duration)>,
     packet_loss: f64,
     blocked_peers: Arc<RwLock<HashSet<NodeId>>>,
+    max_message_size_bytes: usize,
 ) {
     let peer_id = Config::node_id(&peer.name);
     let mut backoff = Duration::from_millis(500);
@@ -320,7 +329,7 @@ async fn connect_to_peer(
                 tokio::spawn(writer_task(write_half, rx, peer_name2, peer_id, delay, packet_loss, blocked_peers.clone()));
 
                 // Reader task (blocks until connection drops)
-                reader_task(read_half, peer_id, env_tx.clone(), blocked_peers.clone()).await;
+                reader_task(read_half, peer_id, env_tx.clone(), blocked_peers.clone(), max_message_size_bytes).await;
 
                 warn!("Connection to {} dropped, reconnecting…", peer.name);
                 conns.write().remove(&peer_id);
@@ -347,6 +356,7 @@ async fn handle_incoming(
     delay: Option<(Duration, Duration)>,
     packet_loss: f64,
     blocked_peers: Arc<RwLock<HashSet<NodeId>>>,
+    max_message_size_bytes: usize,
 ) {
     if let Err(e) = stream.set_nodelay(true) {
         warn!("TCP_NODELAY on accepted connection: {}", e);
@@ -389,7 +399,7 @@ async fn handle_incoming(
     tokio::spawn(writer_task(write_half, rx, peer_name.clone(), peer_id, delay, packet_loss, blocked_peers.clone()));
 
     // Reader task
-    reader_task(read_half, peer_id, env_tx, blocked_peers).await;
+    reader_task(read_half, peer_id, env_tx, blocked_peers, max_message_size_bytes).await;
 
     info!("Peer {} disconnected", peer_name);
     conns.write().remove(&peer_id);
@@ -402,6 +412,7 @@ async fn reader_task(
     peer_id: NodeId,
     env_tx: mpsc::UnboundedSender<Envelope>,
     blocked_peers: Arc<RwLock<HashSet<NodeId>>>,
+    max_message_size_bytes: usize,
 ) {
     // We need a full TcpStream for recv_msg, so wrap with a helper that works
     // on the read half.
@@ -415,12 +426,12 @@ async fn reader_task(
             }
             break;
         }
-        let len = u32::from_be_bytes(len_buf);
-        if len > 16 * 1024 * 1024 {
-            warn!("Message too large ({} bytes) from peer {:x}", len, peer_id);
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > max_message_size_bytes {
+            warn!("Message too large ({} bytes, limit {} bytes) from peer {:x}", len, max_message_size_bytes, peer_id);
             break;
         }
-        let mut buf = vec![0u8; len as usize];
+        let mut buf = vec![0u8; len];
         if let Err(e) = read_half.read_exact(&mut buf).await {
             warn!("Read error body from peer {:x}: {}", peer_id, e);
             break;

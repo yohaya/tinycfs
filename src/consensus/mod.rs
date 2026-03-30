@@ -42,6 +42,11 @@ use crate::persistence::RaftDb;
 /// Max entries per AppendEntries RPC — larger batches amortise per-RPC cost at
 /// high node counts.
 const MAX_ENTRIES_PER_RPC: usize = 1024;
+/// Max byte payload per AppendEntries RPC (approximate; checked entry by entry).
+/// Caps catch-up batch size so serialization latency stays well below the
+/// election timeout, even for large writes in test/debug environments.
+/// 8 MiB gives ~1 ms serialisation in release mode, ~80 ms in debug.
+const MAX_BYTES_PER_RPC: usize = 8 * 1024 * 1024;
 const PROPOSAL_QUEUE_DEPTH: usize = 32_768;
 /// How long propose() keeps retrying when no leader is available.
 const PROPOSE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -914,6 +919,13 @@ impl RaftEngine {
                     all_matches.get(total_voting.saturating_sub(quorum_needed)).copied().unwrap_or(0);
 
                 let term_ok = self.state.log.term_at(quorum_match) == Some(current_term);
+                // Pipeline: if the follower is still behind, send the next batch
+                // immediately without waiting for the next heartbeat tick.
+                let peer_next = next_index.get(&from).copied().unwrap_or(1);
+                if peer_next <= last_index {
+                    should_replicate = true;
+                }
+
                 if quorum_match > self.state.commit_index && term_ok {
                     self.state.commit_index = quorum_match;
                     self.advance_applied();
@@ -1089,8 +1101,20 @@ impl RaftEngine {
         let prev = ni.saturating_sub(1);
 
         // Step 2: collect entries (no role borrow held).
+        // Limit both by entry count and by total payload bytes so that large
+        // writes don't create batches that take longer to serialize/transfer
+        // than the election timeout (causing endless leader disruption).
         let slice = self.state.log.entries_from(prev);
-        let send_count = slice.len().min(MAX_ENTRIES_PER_RPC);
+        let mut send_count = 0;
+        let mut byte_total = 0usize;
+        for entry in slice.iter().take(MAX_ENTRIES_PER_RPC) {
+            let entry_bytes = entry.op.data_len();
+            if send_count > 0 && byte_total + entry_bytes > MAX_BYTES_PER_RPC {
+                break;
+            }
+            byte_total += entry_bytes;
+            send_count += 1;
+        }
         let entries: Vec<_> = slice[..send_count].to_vec();
         let last_sent_index = entries.last().map(|e| e.index);
 

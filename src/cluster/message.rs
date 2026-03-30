@@ -96,6 +96,17 @@ pub enum FileOp {
     },
 }
 
+impl FileOp {
+    /// Approximate data payload size for batch-size accounting.
+    /// Returns the length of the data vector for Write ops, 0 for metadata ops.
+    pub fn data_len(&self) -> usize {
+        match self {
+            FileOp::Write { data, .. } => data.len(),
+            _ => 0,
+        }
+    }
+}
+
 /// Result of a filesystem operation sent back to the waiting client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FileOpResult {
